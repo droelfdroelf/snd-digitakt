@@ -160,6 +160,17 @@ config SND_BCD2000
 	  To compile this driver as a module, choose M here: the module
 	  will be called snd-bcd2000.
 
+config SND_USB_DIGITAKT
+	tristate "Elektron Digitakt Overbridge driver"
+	select SND_PCM
+	select SND_RAWMIDI
+	help
+	  Say Y here to include support for the Elektron Digitakt in Overbridge Mode.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called snd-digitakt.
+
+
 source "sound/usb/line6/Kconfig"
 
 endif	# SND_USB
