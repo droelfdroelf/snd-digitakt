@@ -71,7 +71,7 @@ enum {
 	INTF_CAPTURE,
 	INTF_MIDI,
 
-	INTF_COUNT
+	INTF_COUNT = 5
 };
 
 /* bits in struct digitakt::states */
@@ -468,7 +468,8 @@ static int enable_alt_setting(struct digitakt *dt, unsigned int intf_index,
 		unsigned int altf)
 {
 	struct usb_host_interface *alts;
-
+	dev_dbg(&dt->dev->dev, "setting alt setting for intf %i to %i", intf_index,
+			altf);
 	alts = dt->intf[intf_index]->cur_altsetting;
 	if (alts->desc.bAlternateSetting != altf) {
 		int err = usb_set_interface(dt->dev,
@@ -507,7 +508,7 @@ static void stop_usb_capture(struct digitakt *dt)
 
 	kill_stream_urbs(&dt->capture);
 
-	disable_alt_setting(dt, INTF_CAPTURE);
+	//disable_alt_setting(dt, INTF_CAPTURE);
 }
 
 static int start_usb_capture(struct digitakt *dt)
@@ -521,10 +522,6 @@ static int start_usb_capture(struct digitakt *dt)
 		return 0;
 
 	kill_stream_urbs(&dt->capture);
-
-	err = enable_alt_setting(dt, INTF_CAPTURE, 3);
-	if (err < 0)
-		return err;
 
 	clear_bit(CAPTURE_URB_COMPLETED, &dt->states);
 	dt->capture.urbs[0]->urb.complete = first_capture_urb_complete;
@@ -546,7 +543,7 @@ static void stop_usb_playback(struct digitakt *dt)
 
 	tasklet_kill(&dt->playback_tasklet);
 
-	disable_alt_setting(dt, INTF_PLAYBACK);
+	//disable_alt_setting(dt, INTF_PLAYBACK);
 }
 
 static int start_usb_playback(struct digitakt *dt)
@@ -563,10 +560,6 @@ static int start_usb_playback(struct digitakt *dt)
 
 	kill_stream_urbs(&dt->playback);
 	tasklet_kill(&dt->playback_tasklet);
-
-	err = enable_alt_setting(dt, INTF_PLAYBACK, 2);
-	if (err < 0)
-		return err;
 
 	clear_bit(PLAYBACK_URB_COMPLETED, &dt->states);
 	dt->playback.urbs[0]->urb.complete =
@@ -1088,6 +1081,7 @@ static int alloc_stream_buffers(struct digitakt *dt,
 		dev_err(&dt->dev->dev, "too many packets\n");
 		return -ENXIO;
 	}
+
 	return 0;
 }
 
@@ -1203,13 +1197,7 @@ static int digitakt_probe(struct usb_interface *interface,
 		.type = QUIRK_MIDI_FIXED_ENDPOINT,
 		.data = &midi_ep
 	};
-	static const int intf_numbers[3] = {
-	/* digitakt */
-			[INTF_CAPTURE] = 1,
-			[INTF_PLAYBACK] = 2,
-			[INTF_MIDI] = 3,
 
-	};
 	struct snd_card *card;
 	struct digitakt *dt;
 	unsigned int card_index, i;
@@ -1217,12 +1205,7 @@ static int digitakt_probe(struct usb_interface *interface,
 	const char *name;
 	char usb_path[32];
 	int err;
-
-//	is_ua1000 = usb_id->idProduct == 0x0044;
-
-//	if (interface->altsetting->desc.bInterfaceNumber !=
-//	    intf_numbers[is_ua1000][0])
-//		return -ENODEV;
+	snd_printd("hallotest");
 
 	mutex_lock(&devices_mutex);
 
@@ -1255,25 +1238,41 @@ static int digitakt_probe(struct usb_interface *interface,
 	init_waitqueue_head(&dt->rate_feedback_wait);
 	init_waitqueue_head(&dt->alsa_playback_wait);
 
+//	err = usb_driver_set_configuration(dt->dev, 1);
+//	if (err < 0) {
+//		goto probe_error;
+//	}
+	snd_printd("sclaim");
 	dt->intf[0] = interface;
 	for (i = 1; i < ARRAY_SIZE(dt->intf); ++i) {
 		dt->intf[i] = usb_ifnum_to_if(dt->dev,
-					      intf_numbers[i]);
+					      i);
 		if (!dt->intf[i]) {
 			dev_err(&dt->dev->dev, "interface %u not found\n",
-				intf_numbers[i]);
+				i);
 			err = -ENXIO;
 			goto probe_error;
 		}
 		err = usb_driver_claim_interface(&digitakt_driver,
 						 dt->intf[i], dt);
+		snd_printd("claim %i is %i", i, err);
 		if (err < 0) {
 			dt->intf[i] = NULL;
 			err = -EBUSY;
 			goto probe_error;
 		}
 	}
+	snd_printd("eclaim");
 
+	err = enable_alt_setting(dt, 2, 2);
+	if (err < 0)
+		goto probe_error;
+
+	err = enable_alt_setting(dt, 1, 3);
+	if (err < 0)
+		goto probe_error;
+
+	snd_printd("alt settings ok!");
 	dt->rate = 48000;
 	dt->capture.channels = 12;
 	dt->playback.channels = 2;
@@ -1281,7 +1280,7 @@ static int digitakt_probe(struct usb_interface *interface,
 	// and hardcode stuff ...
 	dt->capture.usb_pipe = usb_rcvintpipe(dt->dev, 3);
 	dt->capture.max_packet_bytes = 368;
-	dt->playback.usb_pipe = usb_rcvintpipe(dt->dev, 3);
+	dt->playback.usb_pipe = usb_sndintpipe(dt->dev, 3);
 	dt->playback.max_packet_bytes = 88;
 	dt->format_bit = SNDRV_PCM_FORMAT_S32_BE;
 
@@ -1318,7 +1317,7 @@ static int digitakt_probe(struct usb_interface *interface,
 	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_PLAYBACK, &playback_pcm_ops);
 	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_CAPTURE, &capture_pcm_ops);
 
-	err = snd_usbmidi_create(card, dt->intf[INTF_MIDI],
+	err = snd_usbmidi_create(card, dt->intf[3],
 				 &dt->midi_list, &midi_quirk);
 	if (err < 0)
 		goto probe_error;
@@ -1331,6 +1330,7 @@ static int digitakt_probe(struct usb_interface *interface,
 	devices_used |= 1 << card_index;
 
 	mutex_unlock(&devices_mutex);
+	snd_printd("probe ok!");
 	return 0;
 
 probe_error:
@@ -1342,35 +1342,35 @@ probe_error:
 
 static void digitakt_disconnect(struct usb_interface *interface)
 {
-	struct digitakt *ua = usb_get_intfdata(interface);
+	struct digitakt *dt = usb_get_intfdata(interface);
 	struct list_head *midi;
 
-	if (!ua)
+	if (!dt)
 		return;
 
 	mutex_lock(&devices_mutex);
 
-	set_bit(DISCONNECTED, &ua->states);
-	wake_up(&ua->rate_feedback_wait);
+	set_bit(DISCONNECTED, &dt->states);
+	wake_up(&dt->rate_feedback_wait);
 
 	/* make sure that userspace cannot create new requests */
-	snd_card_disconnect(ua->card);
+	snd_card_disconnect(dt->card);
 
 	/* make sure that there are no pending USB requests */
-	list_for_each(midi, &ua->midi_list)
+	list_for_each(midi, &dt->midi_list)
 		snd_usbmidi_disconnect(midi);
-	abort_alsa_playback(ua);
-	abort_alsa_capture(ua);
-	mutex_lock(&ua->mutex);
-	stop_usb_playback(ua);
-	stop_usb_capture(ua);
-	mutex_unlock(&ua->mutex);
+	abort_alsa_playback(dt);
+	abort_alsa_capture(dt);
+	mutex_lock(&dt->mutex);
+	stop_usb_playback(dt);
+	stop_usb_capture(dt);
+	mutex_unlock(&dt->mutex);
 
-	free_usb_related_resources(ua, interface);
+	free_usb_related_resources(dt, interface);
 
-	devices_used &= ~(1 << ua->card_index);
+	devices_used &= ~(1 << dt->card_index);
 
-	snd_card_free_when_closed(ua->card);
+	snd_card_free_when_closed(dt->card);
 
 	mutex_unlock(&devices_mutex);
 }
