@@ -32,6 +32,14 @@ MODULE_AUTHOR("Stefan Rehm <droelfdroelf@gmail.com>");
 MODULE_LICENSE("GPL v2");
 MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
 
+#define DT_SAMPLES_PER_URB	49	// 7 blocks of 7 samples per URB
+#define DT_SAMPLES_PER_PACKET 7
+#define DT_PLAYBACK_PACKET_LEN  88
+#define DT_CAPTURE_PACKET_LEN  386
+
+#define TRANSFER_OUT_DATA_SIZE 2112
+#define TRANSFER_IN_DATA_SIZE 8832
+
 /*
  * Should not be lower than the minimum scheduling delay of the host
  * controller.  Some Intel controllers need more than one frame; as long as
@@ -39,7 +47,7 @@ MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
  */
 #define MIN_QUEUE_LENGTH	12
 /* Somewhat random. */
-#define MAX_QUEUE_LENGTH	30
+#define MAX_QUEUE_LENGTH	32
 /*
  * This magic value optimizes memory usage efficiency for the UA-101's packet
  * sizes at all sample rates, taking into account the stupid cache pool sizes
@@ -47,14 +55,14 @@ MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
  */
 #define DEFAULT_QUEUE_LENGTH	21
 
-#define MAX_PACKET_SIZE		672 /* hardware specific */
-#define MAX_MEMORY_BUFFERS	DIV_ROUND_UP(MAX_QUEUE_LENGTH, \
-					     PAGE_SIZE / MAX_PACKET_SIZE)
+//#define MAX_PACKET_SIZE	 DT_CAPTURE_PACKET_LEN * 7/* hardware specific */
+#define MAX_MEMORY_BUFFERS	MAX_QUEUE_LENGTH
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 static unsigned int queue_length = 21;
+
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "card index");
@@ -122,7 +130,7 @@ struct digitakt {
 		unsigned int queue_length;
 		struct digitakt_urb {
 			struct urb urb;
-			struct usb_iso_packet_descriptor iso_frame_desc[1];
+//			struct usb_iso_packet_descriptor iso_frame_desc[1];
 			struct list_head ready_list;
 		} *urbs[MAX_QUEUE_LENGTH];
 		struct {
@@ -165,8 +173,26 @@ static const char *usb_error_string(int err)
 	}
 }
 
+/*
+ *  fill in dummy timestamp in playback data
+ */
+static void fill_in_meta_playback(u8* data, unsigned int len) {
+	static u16 dummy_timestamp = 0;
+	unsigned int offs = 0;
+	snd_printd("fill_in_meta_playback");
+	while (offs < len) {
+		data[offs] = 0x07;
+		data[offs + 1] = 0xFF;
+		data[offs + 2] = (dummy_timestamp >> 8) & 0xFF;
+		data[offs + 3] = (dummy_timestamp) & 0xFF;
+		offs += 88;	// block length
+		dummy_timestamp += 7;
+	}
+}
+
 static void abort_usb_capture(struct digitakt *dt)
 {
+	snd_printd("abort_usb_capture");
 	if (test_and_clear_bit(USB_CAPTURE_RUNNING, &dt->states)) {
 		wake_up(&dt->alsa_capture_wait);
 		wake_up(&dt->rate_feedback_wait);
@@ -175,6 +201,7 @@ static void abort_usb_capture(struct digitakt *dt)
 
 static void abort_usb_playback(struct digitakt *dt)
 {
+	snd_printd("abort_usb_playback");
 	if (test_and_clear_bit(USB_PLAYBACK_RUNNING, &dt->states))
 		wake_up(&dt->alsa_playback_wait);
 }
@@ -184,7 +211,7 @@ static void playback_urb_complete(struct urb *usb_urb)
 	struct digitakt_urb *urb = (struct digitakt_urb *) usb_urb;
 	struct digitakt *dt = urb->urb.context;
 	unsigned long flags;
-
+	snd_printd("playback_urb_complete");
 	if (unlikely(urb->urb.status == -ENOENT ||	/* unlinked */
 		     urb->urb.status == -ENODEV ||	/* device removed */
 		     urb->urb.status == -ECONNRESET ||	/* unlinked */
@@ -200,9 +227,8 @@ static void playback_urb_complete(struct urb *usb_urb)
 		list_add_tail(&urb->ready_list, &dt->ready_playback_urbs);
 		if (dt->rate_feedback_count > 0)
 			tasklet_schedule(&dt->playback_tasklet);
-		dt->playback.substream->runtime->delay -=
-				urb->urb.iso_frame_desc[0].length /
-						dt->playback.frame_bytes;
+		dt->playback.substream->runtime->delay -= 1;
+		//	DT_SAMPLES_PER_URB;// todo: fix for variable number of packets per urb
 		spin_unlock_irqrestore(&dt->lock, flags);
 	}
 }
@@ -210,7 +236,7 @@ static void playback_urb_complete(struct urb *usb_urb)
 static void first_playback_urb_complete(struct urb *urb)
 {
 	struct digitakt *dt = urb->context;
-
+	snd_printd("first_playback_urb_complete");
 	urb->complete = playback_urb_complete;
 	playback_urb_complete(urb);
 
@@ -225,7 +251,7 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 	struct snd_pcm_runtime *runtime;
 	unsigned int frame_bytes, frames1;
 	const u8 *source;
-
+	snd_printd("copy_playback_data");
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
 	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
@@ -269,7 +295,7 @@ static void playback_tasklet(unsigned long data)
 
 	if (unlikely(!test_bit(USB_PLAYBACK_RUNNING, &dt->states)))
 		return;
-
+	snd_printd("playback tasklet");
 	/*
 	 * Synchronizing the playback rate to the capture rate is done by using
 	 * the same sequence of packet sizes for both streams.
@@ -285,7 +311,7 @@ static void playback_tasklet(unsigned long data)
 	while (dt->rate_feedback_count > 0 && !list_empty(&dt->ready_playback_urbs)) {
 		/* take packet size out of FIFO */
 		frames = dt->rate_feedback[dt->rate_feedback_start];
-		add_with_wraparound(dt, &dt->rate_feedback_start, 1);
+		add_with_wraparound(dt, &dt->rate_feedback_start, 7);
 		dt->rate_feedback_count--;
 
 		/* take URB out of FIFO */
@@ -294,17 +320,21 @@ static void playback_tasklet(unsigned long data)
 		list_del(&urb->ready_list);
 
 		/* fill packet with data or silence */
-		urb->urb.iso_frame_desc[0].length =
-			frames * dt->playback.frame_bytes;
+
 		if (test_bit(ALSA_PLAYBACK_RUNNING, &dt->states))
 			do_period_elapsed |= copy_playback_data(&dt->playback,
 								&urb->urb,
 								frames);
 		else
 			memset(urb->urb.transfer_buffer, 0,
-			       urb->urb.iso_frame_desc[0].length);
+					(frames / DT_SAMPLES_PER_PACKET) * DT_PLAYBACK_PACKET_LEN);
+
+		// in any case, fill in header and dummy time stamp
+		fill_in_meta_playback(urb->urb.transfer_buffer,
+				(frames / DT_SAMPLES_PER_PACKET) * DT_PLAYBACK_PACKET_LEN);
 
 		/* and off you go ... */
+		snd_printd("usb_submit_urb");
 		err = usb_submit_urb(&urb->urb, GFP_ATOMIC);
 		if (unlikely(err < 0)) {
 			spin_unlock_irqrestore(&dt->lock, flags);
@@ -326,21 +356,35 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			      unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, frames1;
+	unsigned int frame_bytes, i;
 	u8 *dest;
-
+	struct digitakt *dt = urb->context;
+	snd_printd("copy capture data");
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
+
+	if (frame_bytes != DT_SAMPLES_PER_URB * 4 * 12) {
+		dev_dbg(&dt->dev->dev, "capture data: invalid size %i", frame_bytes);
+		return false;
+	}
+
 	dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		memcpy(dest, urb->transfer_buffer, frames * frame_bytes);
+		void* src = urb->transfer_buffer;
+		for (i = 0; i < 8; i++) {
+			src += 32; // skip block header
+			memcpy(dest, src, 240);
+			src += 240;
+		}
 	} else {
 		/* wrap around at end of ring buffer */
-		frames1 = runtime->buffer_size - stream->buffer_pos;
-		memcpy(dest, urb->transfer_buffer, frames1 * frame_bytes);
-		memcpy(runtime->dma_area,
-		       urb->transfer_buffer + frames1 * frame_bytes,
-		       (frames - frames1) * frame_bytes);
+//		frames1 = runtime->buffer_size - stream->buffer_pos;
+//		memcpy(dest, urb->transfer_buffer, frames1 * frame_bytes);
+//		memcpy(runtime->dma_area,
+//		       urb->transfer_buffer + frames1 * frame_bytes,
+//		       (frames - frames1) * frame_bytes);
+		// this should not happen since we're using fixed block sizes!
+		dev_dbg(&dt->dev->dev, "capture data: wrap around needed!");
 	}
 
 	stream->buffer_pos += frames;
@@ -362,16 +406,15 @@ static void capture_urb_complete(struct urb *urb)
 	unsigned int frames, write_ptr;
 	bool do_period_elapsed;
 	int err;
-
+	snd_printd("capture_urb_complete stat %i", urb->status);
 	if (unlikely(urb->status == -ENOENT ||		/* unlinked */
 		     urb->status == -ENODEV ||		/* device removed */
 		     urb->status == -ECONNRESET ||	/* unlinked */
 		     urb->status == -ESHUTDOWN))	/* device disabled */
 		goto stream_stopped;
 
-	if (urb->status >= 0 && urb->iso_frame_desc[0].status >= 0)
-		frames = urb->iso_frame_desc[0].actual_length /
-			stream->frame_bytes;
+	if (urb->status >= 0)
+		frames = 7 * 24;	// again hard coded ...
 	else
 		frames = 0;
 
@@ -406,7 +449,7 @@ static void capture_urb_complete(struct urb *urb)
 			 * so that the playback stream, when it starts, sees
 			 * the most recent packet sizes.
 			 */
-			add_with_wraparound(dt, &dt->rate_feedback_start, 1);
+					add_with_wraparound(dt, &dt->rate_feedback_start, 7);
 		}
 		if (test_bit(USB_PLAYBACK_RUNNING, &dt->states)
 				&& !list_empty(&dt->ready_playback_urbs))
@@ -430,7 +473,7 @@ stream_stopped:
 static void first_capture_urb_complete(struct urb *urb)
 {
 	struct digitakt *dt = urb->context;
-
+	snd_printd("first_capture_urb_complete");
 	urb->complete = capture_urb_complete;
 	capture_urb_complete(urb);
 
@@ -442,7 +485,7 @@ static int submit_stream_urbs(struct digitakt *dt,
 		struct digitakt_stream *stream)
 {
 	unsigned int i;
-
+	snd_printd("submit_stream_urbs");
 	for (i = 0; i < stream->queue_length; ++i) {
 
 		int err = usb_submit_urb(&stream->urbs[i]->urb, GFP_KERNEL);
@@ -452,13 +495,14 @@ static int submit_stream_urbs(struct digitakt *dt,
 			return err;
 		}
 	}
+	snd_printd("submit_stream_urbs OK");
 	return 0;
 }
 
 static void kill_stream_urbs(struct digitakt_stream *stream)
 {
 	unsigned int i;
-
+	snd_printd("kill_stream_urbs");
 	for (i = 0; i < stream->queue_length; ++i)
 		if (stream->urbs[i])
 			usb_kill_urb(&stream->urbs[i]->urb);
@@ -504,6 +548,7 @@ static void disable_alt_setting(struct digitakt *dt, unsigned int intf_index)
 
 static void stop_usb_capture(struct digitakt *dt)
 {
+	snd_printd("stop usb capture");
 	clear_bit(USB_CAPTURE_RUNNING, &dt->states);
 
 	kill_stream_urbs(&dt->capture);
@@ -514,7 +559,7 @@ static void stop_usb_capture(struct digitakt *dt)
 static int start_usb_capture(struct digitakt *dt)
 {
 	int err;
-
+	snd_printd("start usb capture");
 	if (test_bit(DISCONNECTED, &dt->states))
 		return -ENODEV;
 
@@ -532,11 +577,14 @@ static int start_usb_capture(struct digitakt *dt)
 	err = submit_stream_urbs(dt, &dt->capture);
 	if (err < 0)
 		stop_usb_capture(dt);
+	if (!err)
+		snd_printd("start usb capture OK");
 	return err;
 }
 
 static void stop_usb_playback(struct digitakt *dt)
 {
+	snd_printd("sstop usb playback");
 	clear_bit(USB_PLAYBACK_RUNNING, &dt->states);
 
 	kill_stream_urbs(&dt->playback);
@@ -572,6 +620,8 @@ static int start_usb_playback(struct digitakt *dt)
 	 * We submit the initial URBs all at once, so we have to wait for the
 	 * packet size FIFO to be full.
 	 */
+	snd_printd("playback wof");
+
 	wait_event(dt->rate_feedback_wait,
 			dt->rate_feedback_count >= dt->playback.queue_length
 					|| !test_bit(USB_CAPTURE_RUNNING, &dt->states)
@@ -589,31 +639,34 @@ static int start_usb_playback(struct digitakt *dt)
 		/* all initial URBs contain silence */
 		spin_lock_irq(&dt->lock);
 		frames = dt->rate_feedback[dt->rate_feedback_start];
-		add_with_wraparound(dt, &dt->rate_feedback_start, 1);
+				add_with_wraparound(dt, &dt->rate_feedback_start, 7);
 		dt->rate_feedback_count--;
 		spin_unlock_irq(&dt->lock);
 		urb = &dt->playback.urbs[i]->urb;
-		urb->iso_frame_desc[0].length =
-			frames * dt->playback.frame_bytes;
-		memset(urb->transfer_buffer, 0,
-		       urb->iso_frame_desc[0].length);
+
+		memset(urb->transfer_buffer, 0, 88 * 24);
+		fill_in_meta_playback(urb->transfer_buffer, 88 * 24);
 	}
 
 	set_bit(USB_PLAYBACK_RUNNING, &dt->states);
 	err = submit_stream_urbs(dt, &dt->playback);
 	if (err < 0)
 		stop_usb_playback(dt);
+	if (!err)
+		snd_printd("start usb playback OK");
 	return err;
 }
 
 static void abort_alsa_capture(struct digitakt *dt)
 {
+	snd_printd("abort_alsa_capture");
 	if (test_bit(ALSA_CAPTURE_RUNNING, &dt->states))
 		snd_pcm_stop_xrun(dt->capture.substream);
 }
 
 static void abort_alsa_playback(struct digitakt *dt)
 {
+	snd_printd("abort_alsa_playback");
 	if (test_bit(ALSA_PLAYBACK_RUNNING, &dt->states))
 		snd_pcm_stop_xrun(dt->playback.substream);
 }
@@ -623,7 +676,7 @@ static int set_stream_hw(struct digitakt *dt,
 			 unsigned int channels)
 {
 	int err;
-
+	snd_printd("set_stream_hw");
 	substream->runtime->hw.info =
 		SNDRV_PCM_INFO_MMAP |
 		SNDRV_PCM_INFO_MMAP_VALID |
@@ -637,11 +690,16 @@ static int set_stream_hw(struct digitakt *dt,
 	substream->runtime->hw.rate_max = dt->rate;
 	substream->runtime->hw.channels_min = channels;
 	substream->runtime->hw.channels_max = channels;
-	substream->runtime->hw.buffer_bytes_max = 45000 * 1024;
-	substream->runtime->hw.period_bytes_min = 1;
-	substream->runtime->hw.period_bytes_max = UINT_MAX;
 	substream->runtime->hw.periods_min = 2;
-	substream->runtime->hw.periods_max = UINT_MAX;
+	substream->runtime->hw.periods_max = 16;
+
+	substream->runtime->hw.buffer_bytes_max = 16 * DT_SAMPLES_PER_URB * 4
+			* channels;
+	// for now we support only a fixed buffer size
+	substream->runtime->hw.period_bytes_min = 2 * DT_SAMPLES_PER_URB * 4
+			* channels;
+	substream->runtime->hw.period_bytes_max = 16 * DT_SAMPLES_PER_URB * 4
+			* channels;
 	err = snd_pcm_hw_constraint_minmax(substream->runtime,
 					   SNDRV_PCM_HW_PARAM_PERIOD_TIME,
 					   1500000 / dt->packets_per_second,
@@ -649,6 +707,9 @@ static int set_stream_hw(struct digitakt *dt,
 	if (err < 0)
 		return err;
 	err = snd_pcm_hw_constraint_msbits(substream->runtime, 0, 32, 24);
+	if (!err) {
+		snd_printd("set_stream_hw OK");
+	}
 	return err;
 }
 
@@ -656,7 +717,7 @@ static int capture_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
 	int err;
-
+	snd_printd("capture_pcm_open");
 	dt->capture.substream = substream;
 	err = set_stream_hw(dt, substream, dt->capture.channels);
 	if (err < 0)
@@ -671,6 +732,9 @@ static int capture_pcm_open(struct snd_pcm_substream *substream)
 	if (err >= 0)
 		set_bit(ALSA_CAPTURE_OPEN, &dt->states);
 	mutex_unlock(&dt->mutex);
+	if (!err) {
+		snd_printd("capture_pcm_open OK");
+	}
 	return err;
 }
 
@@ -678,7 +742,7 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
 	int err;
-
+	snd_printd("playback_pcm_open");
 	dt->playback.substream = substream;
 	err = set_stream_hw(dt, substream, dt->playback.channels);
 	if (err < 0)
@@ -700,6 +764,9 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 	set_bit(ALSA_PLAYBACK_OPEN, &dt->states);
 error:
 	mutex_unlock(&dt->mutex);
+	if (!err) {
+		snd_printd("playback_pcm_open OK");
+	}
 	return err;
 }
 
@@ -712,6 +779,7 @@ static int capture_pcm_close(struct snd_pcm_substream *substream)
 	if (!test_bit(ALSA_PLAYBACK_OPEN, &dt->states))
 		stop_usb_capture(dt);
 	mutex_unlock(&dt->mutex);
+	snd_printd("capture_pcm_close");
 	return 0;
 }
 
@@ -725,6 +793,7 @@ static int playback_pcm_close(struct snd_pcm_substream *substream)
 	if (!test_bit(ALSA_CAPTURE_OPEN, &dt->states))
 		stop_usb_capture(dt);
 	mutex_unlock(&dt->mutex);
+	snd_printd("playback_pcm_close");
 	return 0;
 }
 
@@ -739,7 +808,7 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 	mutex_unlock(&dt->mutex);
 	if (err < 0)
 		return err;
-
+	snd_printd("record_pcm_hw_params");
 	return snd_pcm_lib_alloc_vmalloc_buffer(substream,
 						params_buffer_bytes(hw_params));
 }
@@ -757,7 +826,7 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	mutex_unlock(&dt->mutex);
 	if (err < 0)
 		return err;
-
+	snd_printd("playback_pcm_hw_params");
 	return snd_pcm_lib_alloc_vmalloc_buffer(substream,
 						params_buffer_bytes(hw_params));
 }
@@ -771,7 +840,7 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
 	int err;
-
+	snd_printd("capture_pcm_prepare(..)");
 	mutex_lock(&dt->mutex);
 	err = start_usb_capture(dt);
 	mutex_unlock(&dt->mutex);
@@ -791,7 +860,7 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 		return -ENODEV;
 	if (!test_bit(USB_CAPTURE_RUNNING, &dt->states))
 		return -EIO;
-
+	snd_printd("capture_pcm_prepare(..) OK");
 	dt->capture.period_pos = 0;
 	dt->capture.buffer_pos = 0;
 	return 0;
@@ -801,7 +870,7 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
 	int err;
-
+	snd_printd("playback_pcm_prepare(..)");
 	mutex_lock(&dt->mutex);
 	err = start_usb_capture(dt);
 	if (err >= 0)
@@ -822,6 +891,7 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	substream->runtime->delay = 0;
 	dt->playback.period_pos = 0;
 	dt->playback.buffer_pos = 0;
+	snd_printd("playback_pcm_prepare(..) OK");
 	return 0;
 }
 
@@ -831,11 +901,13 @@ static int capture_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		snd_printd("a trig STOP!");
 		if (!test_bit(USB_CAPTURE_RUNNING, &dt->states))
 			return -EIO;
 		set_bit(ALSA_CAPTURE_RUNNING, &dt->states);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
+		snd_printd("a trig STOP!");
 		clear_bit(ALSA_CAPTURE_RUNNING, &dt->states);
 		return 0;
 	default:
@@ -849,11 +921,13 @@ static int playback_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		snd_printd("p trig START!");
 		if (!test_bit(USB_PLAYBACK_RUNNING, &dt->states))
 			return -EIO;
 		set_bit(ALSA_PLAYBACK_RUNNING, &dt->states);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
+		snd_printd("p trig STOP!");
 		clear_bit(ALSA_PLAYBACK_RUNNING, &dt->states);
 		return 0;
 	default:
@@ -1047,7 +1121,7 @@ static const struct snd_pcm_ops playback_pcm_ops = {
 static int alloc_stream_buffers(struct digitakt *dt,
 		struct digitakt_stream *stream)
 {
-	unsigned int remaining_packets, packets, packets_per_page, i;
+	unsigned int i;
 	size_t size;
 
 	stream->queue_length = queue_length;
@@ -1056,32 +1130,21 @@ static int alloc_stream_buffers(struct digitakt *dt,
 	stream->queue_length = min(stream->queue_length,
 				   (unsigned int)MAX_QUEUE_LENGTH);
 
-	/*
-	 * The cache pool sizes used by usb_alloc_coherent() (128, 512, 2048) are
-	 * quite bad when used with the packet sizes of this device (e.g. 280,
-	 * 520, 624).  Therefore, we allocate and subdivide entire pages, using
-	 * a smaller buffer only for the last chunk.
-	 */
-	remaining_packets = stream->queue_length;
-	packets_per_page = PAGE_SIZE / stream->max_packet_bytes;
 	for (i = 0; i < ARRAY_SIZE(stream->buffers); ++i) {
-		packets = min(remaining_packets, packets_per_page);
-		size = packets * stream->max_packet_bytes;
+
+		size = stream->max_packet_bytes;
 		stream->buffers[i].addr =
 			usb_alloc_coherent(dt->dev, size, GFP_KERNEL,
 					   &stream->buffers[i].dma);
-		if (!stream->buffers[i].addr)
+		if (!stream->buffers[i].addr) {
+			snd_printd("alloc_stream_buffers(%lu) failed!", size);
 			return -ENOMEM;
+		} else {
+			snd_printd("alloc_stream_buffers(%lu) OK!", size);
+		}
 		stream->buffers[i].size = size;
-		remaining_packets -= packets;
-		if (!remaining_packets)
-			break;
 	}
-	if (remaining_packets) {
-		dev_err(&dt->dev->dev, "too many packets\n");
-		return -ENXIO;
-	}
-
+	snd_printd("alloc_stream_buffers ok!");
 	return 0;
 }
 
@@ -1103,43 +1166,41 @@ static int alloc_stream_urbs(struct digitakt *dt,
 {
 	unsigned max_packet_size = stream->max_packet_bytes;
 	struct digitakt_urb *urb;
-	unsigned int b, u = 0;
+	unsigned int b = 0;
+
+	snd_printd("stream->max_packet_bytes = %u", max_packet_size);
 
 	for (b = 0; b < ARRAY_SIZE(stream->buffers); ++b) {
 		unsigned int size = stream->buffers[b].size;
 		u8 *addr = stream->buffers[b].addr;
 		dma_addr_t dma = stream->buffers[b].dma;
-
-		while (size >= max_packet_size) {
-			if (u >= stream->queue_length)
-				goto bufsize_error;
-			urb = kmalloc(sizeof(*urb), GFP_KERNEL);
-			if (!urb)
-				return -ENOMEM;
-			usb_init_urb(&urb->urb);
-			urb->urb.dev = dt->dev;
-			urb->urb.pipe = stream->usb_pipe;
-			urb->urb.transfer_flags = URB_NO_TRANSFER_DMA_MAP;
-			urb->urb.transfer_buffer = addr;
-			urb->urb.transfer_dma = dma;
-			urb->urb.transfer_buffer_length = max_packet_size;
-			urb->urb.number_of_packets = 1;
-			urb->urb.interval = 1;
-			urb->urb.context = dt;
-			urb->urb.complete = urb_complete;
-			urb->urb.iso_frame_desc[0].offset = 0;
-			urb->urb.iso_frame_desc[0].length = max_packet_size;
-			stream->urbs[u++] = urb;
-			size -= max_packet_size;
-			addr += max_packet_size;
-			dma += max_packet_size;
-		}
+		snd_printd("addr = %16X", addr);
+		snd_printd("b = %u", b);
+		snd_printd("size = %u", size);
+		snd_printd("dma_addr = %16X", dma);
+		urb = kmalloc(sizeof(*urb), GFP_KERNEL);
+		if (!urb)
+			return -ENOMEM;
+		snd_printd("kmalloc ok!");
+		usb_init_urb(&urb->urb);
+		snd_printd("init_urb ok!");
+		urb->urb.dev = dt->dev;
+		urb->urb.pipe = stream->usb_pipe;
+		urb->urb.transfer_flags = URB_NO_TRANSFER_DMA_MAP;
+		urb->urb.transfer_buffer = addr;
+		urb->urb.transfer_dma = dma;
+		urb->urb.transfer_buffer_length = max_packet_size;
+		urb->urb.number_of_packets = 7;
+		urb->urb.interval = 1;
+		urb->urb.context = dt;
+		urb->urb.complete = urb_complete;
+		//urb->urb.iso_frame_desc[0].offset = 0;
+		//urb->urb.iso_frame_desc[0].length = max_packet_size;
+		stream->urbs[b] = urb;
 	}
-	if (u == stream->queue_length)
-		return 0;
-bufsize_error:
-	dev_err(&dt->dev->dev, "internal buffer size error\n");
-	return -ENXIO;
+
+	snd_printd("alloc_stream_urbs ok!");
+	return 0;
 }
 
 static void free_stream_urbs(struct digitakt_stream *stream)
@@ -1279,11 +1340,11 @@ static int digitakt_probe(struct usb_interface *interface,
 // we're using int transfers only
 	// and hardcode stuff ...
 	dt->capture.usb_pipe = usb_rcvintpipe(dt->dev, 3);
-	dt->capture.max_packet_bytes = 368;
+	dt->capture.max_packet_bytes = 368 * 24;
 	dt->playback.usb_pipe = usb_sndintpipe(dt->dev, 3);
-	dt->playback.max_packet_bytes = 88;
-	dt->format_bit = SNDRV_PCM_FORMAT_S32_BE;
-
+	dt->playback.max_packet_bytes = 88 * 24;
+	dt->format_bit = SNDRV_PCM_FMTBIT_S32_BE;
+	dt->packets_per_second = 8000;
 
 	name = "Digitakt";
 	strcpy(card->driver, "Digitakt");
@@ -1302,13 +1363,16 @@ static int digitakt_probe(struct usb_interface *interface,
 	if (err < 0)
 		goto probe_error;
 
+	snd_printd("alloc_stream_buffers ok!");
+
 	err = alloc_stream_urbs(dt, &dt->capture, capture_urb_complete);
 	if (err < 0)
 		goto probe_error;
+	snd_printd("alloc_stream_urb capture ok!");
 	err = alloc_stream_urbs(dt, &dt->playback, playback_urb_complete);
 	if (err < 0)
 		goto probe_error;
-
+	snd_printd("alloc_stream_urb playback ok!");
 	err = snd_pcm_new(card, name, 0, 1, 1, &dt->pcm);
 	if (err < 0)
 		goto probe_error;
