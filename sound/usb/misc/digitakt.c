@@ -227,7 +227,7 @@ static void playback_urb_complete(struct urb *usb_urb)
 		list_add_tail(&urb->ready_list, &dt->ready_playback_urbs);
 		if (dt->rate_feedback_count > 0)
 			tasklet_schedule(&dt->playback_tasklet);
-		dt->playback.substream->runtime->delay -= 1;
+		dt->playback.substream->runtime->delay -= DT_SAMPLES_PER_URB;
 		//	DT_SAMPLES_PER_URB;// todo: fix for variable number of packets per urb
 		spin_unlock_irqrestore(&dt->lock, flags);
 	}
@@ -249,20 +249,24 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 			       unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, frames1;
-	const u8 *source;
+	unsigned int frame_bytes, frames1, i;
+	const u8 *source, *dst;
 	snd_printd("copy_playback_data");
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
 	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		memcpy(urb->transfer_buffer, source, frames * frame_bytes);
+
 	} else {
-		/* wrap around at end of ring buffer */
-		frames1 = runtime->buffer_size - stream->buffer_pos;
-		memcpy(urb->transfer_buffer, source, frames1 * frame_bytes);
-		memcpy(urb->transfer_buffer + frames1 * frame_bytes,
-		       runtime->dma_area, (frames - frames1) * frame_bytes);
+		// restart at the beginning of the buffer
+		source = runtime->dma_area;
+	}
+	dst = urb->transfer_buffer;
+	for (i = 0; i < 8; i++) {
+		dst += 32; // skip block header
+		memcpy(dst, source, 56);
+		dst += 56;
+		source += 56;
 	}
 
 	stream->buffer_pos += frames;
@@ -311,7 +315,7 @@ static void playback_tasklet(unsigned long data)
 	while (dt->rate_feedback_count > 0 && !list_empty(&dt->ready_playback_urbs)) {
 		/* take packet size out of FIFO */
 		frames = dt->rate_feedback[dt->rate_feedback_start];
-		add_with_wraparound(dt, &dt->rate_feedback_start, 7);
+		add_with_wraparound(dt, &dt->rate_feedback_start, 1);
 		dt->rate_feedback_count--;
 
 		/* take URB out of FIFO */
@@ -347,8 +351,8 @@ static void playback_tasklet(unsigned long data)
 		dt->playback.substream->runtime->delay += frames;
 	}
 	spin_unlock_irqrestore(&dt->lock, flags);
-	if (do_period_elapsed)
-		snd_pcm_period_elapsed(dt->playback.substream);
+	// if (do_period_elapsed)
+	snd_pcm_period_elapsed(dt->playback.substream);
 }
 
 /* copy data from the URB buffer into the ALSA ring buffer */
@@ -356,7 +360,7 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			      unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, i;
+	unsigned int frame_bytes, i, frames1;
 	u8 *dest;
 	struct digitakt *dt = urb->context;
 	snd_printd("copy capture data");
@@ -368,34 +372,28 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 		return false;
 	}
 
-	dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		void* src = urb->transfer_buffer;
-		for (i = 0; i < 8; i++) {
-			src += 32; // skip block header
-			memcpy(dest, src, 240);
-			src += 240;
-		}
+		dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	} else {
-		/* wrap around at end of ring buffer */
-//		frames1 = runtime->buffer_size - stream->buffer_pos;
-//		memcpy(dest, urb->transfer_buffer, frames1 * frame_bytes);
-//		memcpy(runtime->dma_area,
-//		       urb->transfer_buffer + frames1 * frame_bytes,
-//		       (frames - frames1) * frame_bytes);
-		// this should not happen since we're using fixed block sizes!
-		dev_dbg(&dt->dev->dev, "capture data: wrap around needed!");
+		dev_dbg(&dt->dev->dev, "capture data: wrap around");
+		dest = runtime->dma_area;
 	}
-
+	void* src = urb->transfer_buffer;
+	for (i = 0; i < 8; i++) {
+		src += 32; // skip block header
+		memcpy(dest, src, 240);
+		src += 240;
+	}
 	stream->buffer_pos += frames;
 	if (stream->buffer_pos >= runtime->buffer_size)
 		stream->buffer_pos -= runtime->buffer_size;
 	stream->period_pos += frames;
 	if (stream->period_pos >= runtime->period_size) {
 		stream->period_pos -= runtime->period_size;
-		return true;
+		//return true;
 	}
-	return false;
+	//return false;
+	return true;
 }
 
 static void capture_urb_complete(struct urb *urb)
@@ -414,7 +412,7 @@ static void capture_urb_complete(struct urb *urb)
 		goto stream_stopped;
 
 	if (urb->status >= 0)
-		frames = 7 * 24;	// again hard coded ...
+		frames = DT_SAMPLES_PER_URB;	// again hard coded ...
 	else
 		frames = 0;
 
@@ -449,7 +447,7 @@ static void capture_urb_complete(struct urb *urb)
 			 * so that the playback stream, when it starts, sees
 			 * the most recent packet sizes.
 			 */
-					add_with_wraparound(dt, &dt->rate_feedback_start, 7);
+			add_with_wraparound(dt, &dt->rate_feedback_start, 1);
 		}
 		if (test_bit(USB_PLAYBACK_RUNNING, &dt->states)
 				&& !list_empty(&dt->ready_playback_urbs))
@@ -639,7 +637,7 @@ static int start_usb_playback(struct digitakt *dt)
 		/* all initial URBs contain silence */
 		spin_lock_irq(&dt->lock);
 		frames = dt->rate_feedback[dt->rate_feedback_start];
-				add_with_wraparound(dt, &dt->rate_feedback_start, 7);
+		add_with_wraparound(dt, &dt->rate_feedback_start, 1);
 		dt->rate_feedback_count--;
 		spin_unlock_irq(&dt->lock);
 		urb = &dt->playback.urbs[i]->urb;
