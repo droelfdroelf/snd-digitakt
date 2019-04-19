@@ -32,36 +32,37 @@ MODULE_AUTHOR("Stefan Rehm <droelfdroelf@gmail.com>");
 MODULE_LICENSE("GPL v2");
 MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
 
-#define DT_SAMPLES_PER_URB	49	// 7 blocks of 7 samples per URB
-#define DT_SAMPLES_PER_PACKET 7
-#define DT_PLAYBACK_PACKET_LEN  88
-#define DT_CAPTURE_PACKET_LEN  386
-
-#define TRANSFER_OUT_DATA_SIZE 2112
-#define TRANSFER_IN_DATA_SIZE 8832
-
 /*
- * Should not be lower than the minimum scheduling delay of the host
- * controller.  Some Intel controllers need more than one frame; as long as
- * that driver doesn't tell us about this, use 1.5 frames just to be sure.
+ * a "default" transfer is 24 blocks long, each holding 7 samples
+ * TBD: Can we decrease the length to reduce latency??
  */
-#define MIN_QUEUE_LENGTH	12
-/* Somewhat random. */
-#define MAX_QUEUE_LENGTH	32
-/*
- * This magic value optimizes memory usage efficiency for the UA-101's packet
- * sizes at all sample rates, taking into account the stupid cache pool sizes
- * that usb_alloc_coherent() uses.
- */
-#define DEFAULT_QUEUE_LENGTH	21
 
-//#define MAX_PACKET_SIZE	 DT_CAPTURE_PACKET_LEN * 7/* hardware specific */
-#define MAX_MEMORY_BUFFERS	MAX_QUEUE_LENGTH
+#define MIN_TRANSFER_SIZE_BLOCKS	2
+#define MAX_TRANSFER_SIZE_BLOCKS	24
+#define DEFAULT_TRANSFER_SIZE_BLOCKS	24
+#define MAX_MEMORY_BUFFERS	MAX_TRANSFER_SIZE_BLOCKS
+
+static unsigned int transfer_size_blocks = DEFAULT_TRANSFER_SIZE_BLOCKS;
+
+// two output channels
+#define DT_NUM_PLAYBACK_CHANS	2
+
+// 8 sample channels, 2 fx channels, 2 ext in channels
+#define DT_NUM_RECORD_CHANS	12
+
+#define DT_SAMPLES_PER_BLOCK 7
+#define DT_BYTES_PER_SAMPLE	4 // uint32_t BE
+#define DT_SAMPLES_PER_URB	(transfer_size_blocks * DT_SAMPLES_PER_BLOCK )	// 168 samples long by default
+#define DT_HEADER_SIZE_BYTES	32
+#define DT_PLAYBACK_BLOCK_LEN_BYTES  ( DT_HEADER_SIZE_BYTES + ( DT_SAMPLES_PER_BLOCK * DT_BYTES_PER_SAMPLE * DT_NUM_PLAYBACK_CHANS))// usually 88
+#define DT_RECORD_BLOCK_LEN_BYTES  ( DT_HEADER_SIZE_BYTES + ( DT_SAMPLES_PER_BLOCK * DT_BYTES_PER_SAMPLE * DT_NUM_RECORD_CHANS))// usually 386
+
+#define TRANSFER_OUT_DATA_SIZE	(DT_PLAYBACK_BLOCK_LEN_BYTES * transfer_size_blocks) // usually 2112
+#define TRANSFER_IN_DATA_SIZE (DT_RECORD_BLOCK_LEN_BYTES * transfer_size_blocks) // usually 8832
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
-static unsigned int queue_length = 21;
 
 
 module_param_array(index, int, NULL, 0444);
@@ -70,9 +71,8 @@ module_param_array(id, charp, NULL, 0444);
 MODULE_PARM_DESC(id, "ID string");
 module_param_array(enable, bool, NULL, 0444);
 MODULE_PARM_DESC(enable, "enable card");
-module_param(queue_length, uint, 0644);
-MODULE_PARM_DESC(queue_length, "USB queue length in microframes, "
-		 __stringify(MIN_QUEUE_LENGTH)"-"__stringify(MAX_QUEUE_LENGTH));
+module_param(transfer_size_blocks, uint, 0644);
+MODULE_PARM_DESC(transfer_size_blocks, "transfer size in blocks");
 
 enum {
 	INTF_PLAYBACK,
@@ -112,7 +112,7 @@ struct digitakt {
 	/* FIFO to synchronize playback rate to capture rate */
 	unsigned int rate_feedback_start;
 	unsigned int rate_feedback_count;
-	u8 rate_feedback[MAX_QUEUE_LENGTH];
+	u8 rate_feedback[MAX_TRANSFER_SIZE_BLOCKS];
 
 	struct list_head ready_playback_urbs;
 	struct tasklet_struct playback_tasklet;
@@ -130,9 +130,8 @@ struct digitakt {
 		unsigned int queue_length;
 		struct digitakt_urb {
 			struct urb urb;
-//			struct usb_iso_packet_descriptor iso_frame_desc[1];
 			struct list_head ready_list;
-		} *urbs[MAX_QUEUE_LENGTH];
+		}*urbs[MAX_TRANSFER_SIZE_BLOCKS];
 		struct {
 			unsigned int size;
 			void *addr;
@@ -185,8 +184,8 @@ static void fill_in_meta_playback(u8* data, unsigned int len) {
 		data[offs + 1] = 0xFF;
 		data[offs + 2] = (dummy_timestamp >> 8) & 0xFF;
 		data[offs + 3] = (dummy_timestamp) & 0xFF;
-		offs += 88;	// block length
-		dummy_timestamp += 7;
+		offs += DT_PLAYBACK_BLOCK_LEN_BYTES;	// block length, usually 88
+		dummy_timestamp += DT_SAMPLES_PER_BLOCK;
 	}
 }
 
@@ -249,7 +248,7 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 			       unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, frames1, i;
+	unsigned int frame_bytes, i;
 	const u8 *source, *dst;
 	snd_printd("copy_playback_data");
 	runtime = stream->substream->runtime;
@@ -262,11 +261,12 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 		source = runtime->dma_area;
 	}
 	dst = urb->transfer_buffer;
-	for (i = 0; i < 8; i++) {
-		dst += 32; // skip block header
-		memcpy(dst, source, 56);
-		dst += 56;
-		source += 56;
+	for (i = 0; i < transfer_size_blocks; i++) {
+		dst += DT_HEADER_SIZE_BYTES; // skip block header
+		memcpy((void*) dst, (void*) source,
+				DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+		dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+		source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 	}
 
 	stream->buffer_pos += frames;
@@ -331,11 +331,12 @@ static void playback_tasklet(unsigned long data)
 								frames);
 		else
 			memset(urb->urb.transfer_buffer, 0,
-					(frames / DT_SAMPLES_PER_PACKET) * DT_PLAYBACK_PACKET_LEN);
+					(frames / DT_SAMPLES_PER_BLOCK)
+							* DT_PLAYBACK_BLOCK_LEN_BYTES);
 
 		// in any case, fill in header and dummy time stamp
 		fill_in_meta_playback(urb->urb.transfer_buffer,
-				(frames / DT_SAMPLES_PER_PACKET) * DT_PLAYBACK_PACKET_LEN);
+				(frames / DT_SAMPLES_PER_BLOCK) * DT_PLAYBACK_BLOCK_LEN_BYTES);
 
 		/* and off you go ... */
 		snd_printd("usb_submit_urb");
@@ -360,8 +361,9 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			      unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, i, frames1;
+	unsigned int frame_bytes, i;
 	u8 *dest;
+	void* src;
 	struct digitakt *dt = urb->context;
 	snd_printd("copy capture data");
 	runtime = stream->substream->runtime;
@@ -378,11 +380,12 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 		dev_dbg(&dt->dev->dev, "capture data: wrap around");
 		dest = runtime->dma_area;
 	}
-	void* src = urb->transfer_buffer;
-	for (i = 0; i < 8; i++) {
-		src += 32; // skip block header
-		memcpy(dest, src, 240);
-		src += 240;
+
+	src = urb->transfer_buffer;
+	for (i = 0; i < transfer_size_blocks; i++) {
+		src += DT_HEADER_SIZE_BYTES; // skip block header
+		memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+		src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 	}
 	stream->buffer_pos += frames;
 	if (stream->buffer_pos >= runtime->buffer_size)
@@ -526,23 +529,23 @@ static int enable_alt_setting(struct digitakt *dt, unsigned int intf_index,
 	return 0;
 }
 
-static void disable_alt_setting(struct digitakt *dt, unsigned int intf_index)
-{
-	struct usb_host_interface *alts;
-
-	if (!dt->intf[intf_index])
-		return;
-
-	alts = dt->intf[intf_index]->cur_altsetting;
-	if (alts->desc.bAlternateSetting != 0) {
-		int err = usb_set_interface(dt->dev,
-					    alts->desc.bInterfaceNumber, 0);
-		if (err < 0 && !test_bit(DISCONNECTED, &dt->states))
-			dev_warn(&dt->dev->dev,
-				 "interface reset failed; error %d: %s\n",
-				 err, usb_error_string(err));
-	}
-}
+//static void disable_alt_setting(struct digitakt *dt, unsigned int intf_index)
+//{
+//	struct usb_host_interface *alts;
+//
+//	if (!dt->intf[intf_index])
+//		return;
+//
+//	alts = dt->intf[intf_index]->cur_altsetting;
+//	if (alts->desc.bAlternateSetting != 0) {
+//		int err = usb_set_interface(dt->dev,
+//					    alts->desc.bInterfaceNumber, 0);
+//		if (err < 0 && !test_bit(DISCONNECTED, &dt->states))
+//			dev_warn(&dt->dev->dev,
+//				 "interface reset failed; error %d: %s\n",
+//				 err, usb_error_string(err));
+//	}
+//}
 
 static void stop_usb_capture(struct digitakt *dt)
 {
@@ -642,8 +645,10 @@ static int start_usb_playback(struct digitakt *dt)
 		spin_unlock_irq(&dt->lock);
 		urb = &dt->playback.urbs[i]->urb;
 
-		memset(urb->transfer_buffer, 0, 88 * 24);
-		fill_in_meta_playback(urb->transfer_buffer, 88 * 24);
+		memset(urb->transfer_buffer, 0,
+				transfer_size_blocks * DT_PLAYBACK_BLOCK_LEN_BYTES);
+		fill_in_meta_playback(urb->transfer_buffer,
+				transfer_size_blocks * DT_PLAYBACK_BLOCK_LEN_BYTES);
 	}
 
 	set_bit(USB_PLAYBACK_RUNNING, &dt->states);
@@ -696,6 +701,7 @@ static int set_stream_hw(struct digitakt *dt,
 	// for now we support only a fixed buffer size
 	substream->runtime->hw.period_bytes_min = 2 * DT_SAMPLES_PER_URB * 4
 			* channels;
+
 	substream->runtime->hw.period_bytes_max = 16 * DT_SAMPLES_PER_URB * 4
 			* channels;
 	err = snd_pcm_hw_constraint_minmax(substream->runtime,
@@ -989,11 +995,11 @@ static int alloc_stream_buffers(struct digitakt *dt,
 	unsigned int i;
 	size_t size;
 
-	stream->queue_length = queue_length;
+	stream->queue_length = transfer_size_blocks;
 	stream->queue_length = max(stream->queue_length,
-				   (unsigned int)MIN_QUEUE_LENGTH);
+			(unsigned int) MIN_TRANSFER_SIZE_BLOCKS);
 	stream->queue_length = min(stream->queue_length,
-				   (unsigned int)MAX_QUEUE_LENGTH);
+			(unsigned int) MAX_TRANSFER_SIZE_BLOCKS);
 
 	for (i = 0; i < ARRAY_SIZE(stream->buffers); ++i) {
 
@@ -1039,10 +1045,10 @@ static int alloc_stream_urbs(struct digitakt *dt,
 		unsigned int size = stream->buffers[b].size;
 		u8 *addr = stream->buffers[b].addr;
 		dma_addr_t dma = stream->buffers[b].dma;
-		snd_printd("addr = %16X", addr);
+		snd_printd("addr = %llX", (long long unsigned int )addr);
 		snd_printd("b = %u", b);
 		snd_printd("size = %u", size);
-		snd_printd("dma_addr = %16X", dma);
+		snd_printd("dma_addr = %llX", dma);
 		urb = kmalloc(sizeof(*urb), GFP_KERNEL);
 		if (!urb)
 			return -ENOMEM;
@@ -1055,7 +1061,7 @@ static int alloc_stream_urbs(struct digitakt *dt,
 		urb->urb.transfer_buffer = addr;
 		urb->urb.transfer_dma = dma;
 		urb->urb.transfer_buffer_length = max_packet_size;
-		urb->urb.number_of_packets = 7;
+		// urb->urb.number_of_packets = 7;
 		urb->urb.interval = 1;
 		urb->urb.context = dt;
 		urb->urb.complete = urb_complete;
@@ -1202,12 +1208,13 @@ static int digitakt_probe(struct usb_interface *interface,
 	dt->rate = 48000;
 	dt->capture.channels = 12;
 	dt->playback.channels = 2;
-// we're using int transfers only
-	// and hardcode stuff ...
+	// we're using int transfers only
 	dt->capture.usb_pipe = usb_rcvintpipe(dt->dev, 3);
-	dt->capture.max_packet_bytes = 368 * 24;
+	dt->capture.max_packet_bytes = DT_RECORD_BLOCK_LEN_BYTES
+			* transfer_size_blocks;
 	dt->playback.usb_pipe = usb_sndintpipe(dt->dev, 3);
-	dt->playback.max_packet_bytes = 88 * 24;
+	dt->playback.max_packet_bytes = DT_PLAYBACK_BLOCK_LEN_BYTES
+			* transfer_size_blocks;
 	dt->format_bit = SNDRV_PCM_FMTBIT_S32_BE;
 	dt->packets_per_second = 8000;
 
