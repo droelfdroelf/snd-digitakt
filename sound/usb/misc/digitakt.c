@@ -248,25 +248,45 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 			       unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, i;
+	unsigned int frame_bytes, frames1, frames_cpied;
 	const u8 *source, *dst;
-	snd_printd("copy_playback_data");
+
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
+	snd_printd("copy_playback_data: %u", frame_bytes);
 	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
-	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-
-	} else {
-		// restart at the beginning of the buffer
-		source = runtime->dma_area;
-	}
+	frames_cpied = 0;
 	dst = urb->transfer_buffer;
-	for (i = 0; i < transfer_size_blocks; i++) {
-		dst += DT_HEADER_SIZE_BYTES; // skip block header
-		memcpy((void*) dst, (void*) source,
-				DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-		dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-		source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+
+	if (stream->buffer_pos + frames <= runtime->buffer_size) {
+		while (frames_cpied < frames) {
+			dst += DT_HEADER_SIZE_BYTES; // skip block header
+			memcpy((void*) dst, (void*) source,
+					DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			frames_cpied += DT_SAMPLES_PER_BLOCK;
+		}
+	} else {
+		/* wrap around at end of ring buffer */
+		frames1 = runtime->buffer_size - stream->buffer_pos;
+		while (frames_cpied < frames1) {
+			dst += DT_HEADER_SIZE_BYTES; // skip block header
+			memcpy((void*) dst, (void*) source,
+			DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			frames_cpied += DT_SAMPLES_PER_BLOCK;
+		}
+		source = runtime->dma_area;
+		while (frames_cpied < (frames - frames1)) {
+			dst += DT_HEADER_SIZE_BYTES; // skip block header
+			memcpy((void*) dst, (void*) source,
+			DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			frames_cpied += DT_SAMPLES_PER_BLOCK;
+		}
 	}
 
 	stream->buffer_pos += frames;
@@ -352,8 +372,8 @@ static void playback_tasklet(unsigned long data)
 		dt->playback.substream->runtime->delay += frames;
 	}
 	spin_unlock_irqrestore(&dt->lock, flags);
-	// if (do_period_elapsed)
-	snd_pcm_period_elapsed(dt->playback.substream);
+	if (do_period_elapsed)
+		snd_pcm_period_elapsed(dt->playback.substream);
 }
 
 /* copy data from the URB buffer into the ALSA ring buffer */
@@ -361,42 +381,50 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			      unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, i;
+	unsigned int frame_bytes, frames1, frames_cpied;
 	u8 *dest;
 	void* src;
-	struct digitakt *dt = urb->context;
 	snd_printd("copy capture data");
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
-
-	if (frame_bytes != DT_SAMPLES_PER_URB * 4 * 12) {
-		dev_dbg(&dt->dev->dev, "capture data: invalid size %i", frame_bytes);
-		return false;
-	}
-
-	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
-	} else {
-		dev_dbg(&dt->dev->dev, "capture data: wrap around");
-		dest = runtime->dma_area;
-	}
-
+	dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	src = urb->transfer_buffer;
-	for (i = 0; i < transfer_size_blocks; i++) {
-		src += DT_HEADER_SIZE_BYTES; // skip block header
-		memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-		src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+	frames_cpied = 0;
+	if (stream->buffer_pos + frames <= runtime->buffer_size) {
+		while (frames_cpied < frames) {
+			src += DT_HEADER_SIZE_BYTES; // skip block header
+			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			frames_cpied += DT_SAMPLES_PER_BLOCK;
+		}
+	} else {
+		/* wrap around at end of ring buffer */
+		frames1 = runtime->buffer_size - stream->buffer_pos;
+		while (frames_cpied < frames1) {
+			src += DT_HEADER_SIZE_BYTES; // skip block header
+			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			frames_cpied += DT_SAMPLES_PER_BLOCK;
+		}
+		dest = runtime->dma_area;
+		src = urb->transfer_buffer + frames1 * frame_bytes;
+		while (frames_cpied < (frames - frames1)) {
+			src += DT_HEADER_SIZE_BYTES; // skip block header
+			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			frames_cpied += DT_SAMPLES_PER_BLOCK;
+		}
 	}
+
 	stream->buffer_pos += frames;
 	if (stream->buffer_pos >= runtime->buffer_size)
 		stream->buffer_pos -= runtime->buffer_size;
 	stream->period_pos += frames;
 	if (stream->period_pos >= runtime->period_size) {
 		stream->period_pos -= runtime->period_size;
-		//return true;
+		return true;
 	}
-	//return false;
-	return true;
+	return false;
 }
 
 static void capture_urb_complete(struct urb *urb)
@@ -695,7 +723,8 @@ static int set_stream_hw(struct digitakt *dt,
 	substream->runtime->hw.channels_max = channels;
 	substream->runtime->hw.periods_min = 2;
 	substream->runtime->hw.periods_max = 16;
-
+	// make sure to have even block boundaries in the buffers so we can copy whole blocks at once
+	substream->runtime->min_align = channels * DT_SAMPLES_PER_BLOCK * 4;
 	substream->runtime->hw.buffer_bytes_max = 16 * DT_SAMPLES_PER_URB * 4
 			* channels;
 	// for now we support only a fixed buffer size
@@ -1217,6 +1246,9 @@ static int digitakt_probe(struct usb_interface *interface,
 			* transfer_size_blocks;
 	dt->format_bit = SNDRV_PCM_FMTBIT_S32_BE;
 	dt->packets_per_second = 8000;
+
+	dt->playback.frame_bytes = 4 * dt->playback.channels;
+	dt->capture.frame_bytes = 4 * dt->capture.channels;
 
 	name = "Digitakt";
 	strcpy(card->driver, "Digitakt");
