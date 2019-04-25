@@ -40,7 +40,7 @@ MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
 #define MIN_TRANSFER_SIZE_BLOCKS	2
 #define MAX_TRANSFER_SIZE_BLOCKS	24
 #define DEFAULT_TRANSFER_SIZE_BLOCKS	24
-#define MAX_MEMORY_BUFFERS	MAX_TRANSFER_SIZE_BLOCKS
+#define MAX_MEMORY_BUFFERS	24
 
 static unsigned int transfer_size_blocks = DEFAULT_TRANSFER_SIZE_BLOCKS;
 
@@ -722,24 +722,24 @@ static int set_stream_hw(struct digitakt *dt,
 	substream->runtime->hw.channels_min = channels;
 	substream->runtime->hw.channels_max = channels;
 	substream->runtime->hw.periods_min = 2;
-	substream->runtime->hw.periods_max = 16;
+	substream->runtime->hw.periods_max = UINT_MAX;
 	// make sure to have even block boundaries in the buffers so we can copy whole blocks at once
-	substream->runtime->min_align = channels * DT_SAMPLES_PER_BLOCK * 4;
+	//substream->runtime->min_align = channels * DT_SAMPLES_PER_BLOCK * 4;
 	substream->runtime->hw.buffer_bytes_max = 16 * DT_SAMPLES_PER_URB * 4
 			* channels;
 	// for now we support only a fixed buffer size
-	substream->runtime->hw.period_bytes_min = 2 * DT_SAMPLES_PER_URB * 4
-			* channels;
+	substream->runtime->hw.period_bytes_min = 1;
 
-	substream->runtime->hw.period_bytes_max = 16 * DT_SAMPLES_PER_URB * 4
-			* channels;
+	substream->runtime->hw.period_bytes_max = UINT_MAX;
 	err = snd_pcm_hw_constraint_minmax(substream->runtime,
 					   SNDRV_PCM_HW_PARAM_PERIOD_TIME,
 					   1500000 / dt->packets_per_second,
 					   UINT_MAX);
+	snd_printd("chans: %u err: %i", channels, err);
 	if (err < 0)
 		return err;
 	err = snd_pcm_hw_constraint_msbits(substream->runtime, 0, 32, 24);
+	snd_printd("chans: %u err: %i", channels, err);
 	if (!err) {
 		snd_printd("set_stream_hw OK");
 	}
@@ -756,7 +756,8 @@ static int capture_pcm_open(struct snd_pcm_substream *substream)
 	if (err < 0)
 		return err;
 	substream->runtime->hw.fifo_size =
-		DIV_ROUND_CLOSEST(dt->rate,
+		DIV_ROUND_CLOSEST(
+			dt->rate * dt->capture.queue_length,
 			dt->packets_per_second);
 	substream->runtime->delay = substream->runtime->hw.fifo_size;
 
@@ -1023,7 +1024,7 @@ static int alloc_stream_buffers(struct digitakt *dt,
 {
 	unsigned int i;
 	size_t size;
-
+// TODO: smaller?
 	stream->queue_length = transfer_size_blocks;
 	stream->queue_length = max(stream->queue_length,
 			(unsigned int) MIN_TRANSFER_SIZE_BLOCKS);
