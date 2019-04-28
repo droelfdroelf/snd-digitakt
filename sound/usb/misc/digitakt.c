@@ -253,7 +253,8 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
-	snd_printd("copy_playback_data: %u", frame_bytes);
+	snd_printd("copy playback data frame_bytes: %u frames: %u", frame_bytes,
+			frames);
 	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	frames_cpied = 0;
 	dst = urb->transfer_buffer;
@@ -384,9 +385,12 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 	unsigned int frame_bytes, frames1, frames_cpied;
 	u8 *dest;
 	void* src;
-	snd_printd("copy capture data");
+
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
+	snd_printd("copy capture data frame_bytes: %u frames: %u",
+			frame_bytes,
+			frames);
 	dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	src = urb->transfer_buffer;
 	frames_cpied = 0;
@@ -395,6 +399,7 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			src += DT_HEADER_SIZE_BYTES; // skip block header
 			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			dest += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 			frames_cpied += DT_SAMPLES_PER_BLOCK;
 		}
 	} else {
@@ -404,6 +409,7 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			src += DT_HEADER_SIZE_BYTES; // skip block header
 			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			dest += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 			frames_cpied += DT_SAMPLES_PER_BLOCK;
 		}
 		dest = runtime->dma_area;
@@ -412,6 +418,7 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			src += DT_HEADER_SIZE_BYTES; // skip block header
 			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
+			dest += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
 			frames_cpied += DT_SAMPLES_PER_BLOCK;
 		}
 	}
@@ -442,8 +449,10 @@ static void capture_urb_complete(struct urb *urb)
 		     urb->status == -ESHUTDOWN))	/* device disabled */
 		goto stream_stopped;
 
-	if (urb->status >= 0)
+	if (urb->status >= 0) {
+		//urb->actual_length /
 		frames = DT_SAMPLES_PER_URB;	// again hard coded ...
+	}
 	else
 		frames = 0;
 
