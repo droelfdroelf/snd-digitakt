@@ -49,7 +49,8 @@ static unsigned int transfer_size_blocks = DEFAULT_TRANSFER_SIZE_BLOCKS;
 
 // 8 sample channels, 2 fx channels, 2 ext in channels
 #define DT_NUM_RECORD_CHANS	12
-
+#define DT_RECORD_FRAME_BYTES	(DT_NUM_RECORD_CHANS * DT_BYTES_PER_SAMPLE)
+#define DT_PLAYBACK_FRAME_BYTES	(DT_NUM_PLAYBACK_CHANS * DT_BYTES_PER_SAMPLE)
 #define DT_SAMPLES_PER_BLOCK 7
 #define DT_BYTES_PER_SAMPLE	4 // uint32_t BE
 #define DT_SAMPLES_PER_URB	(transfer_size_blocks * DT_SAMPLES_PER_BLOCK )	// 168 samples long by default
@@ -59,7 +60,7 @@ static unsigned int transfer_size_blocks = DEFAULT_TRANSFER_SIZE_BLOCKS;
 
 #define TRANSFER_OUT_DATA_SIZE	(DT_PLAYBACK_BLOCK_LEN_BYTES * transfer_size_blocks) // usually 2112
 #define TRANSFER_IN_DATA_SIZE (DT_RECORD_BLOCK_LEN_BYTES * transfer_size_blocks) // usually 8832
-
+#define MIN(a,b) (((a)<(b))?(a):(b))
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
@@ -173,6 +174,75 @@ static const char *usb_error_string(int err)
 }
 
 /*
+ * copies n frames of the record urb from src to dst with max mbuf buffers, starting at pos
+ * returns true if wraparound occured
+ */
+
+static void cpfmurb(unsigned int n, void* srcurb, unsigned int pos_src,
+		void* dstbuf, unsigned int pos_dst) {
+
+	unsigned int frames_left;
+	unsigned int field;
+	unsigned int frame_in_field;
+	unsigned int frames_to_next_header;
+	unsigned int transfer_size;
+	unsigned int transfer_size_frames;
+	unsigned int pos_src_, pos_dst_;
+	void* src;
+	void* dst;
+	pos_src_ = pos_src;
+	pos_dst_ = pos_dst;
+
+	frames_left = n;
+	while (frames_left) {
+		field = pos_src_ / DT_SAMPLES_PER_BLOCK;
+		frame_in_field = pos_src_ % DT_SAMPLES_PER_BLOCK;
+		frames_to_next_header = DT_SAMPLES_PER_BLOCK - frame_in_field;
+		src = srcurb + (DT_HEADER_SIZE_BYTES * (1 + field))
+				+ (pos_src_ * DT_RECORD_FRAME_BYTES);
+		transfer_size_frames = (MIN(frames_to_next_header, frames_left));
+		transfer_size = transfer_size_frames * DT_RECORD_FRAME_BYTES;
+		dst = dstbuf + (pos_dst_ * DT_RECORD_FRAME_BYTES);
+		memcpy(dst, src, transfer_size);
+		pos_dst_ += transfer_size_frames;
+		pos_src_ += transfer_size_frames;
+		frames_left -= transfer_size_frames;
+	}
+}
+
+static void cptourb(unsigned int n, void* srcbuf, unsigned int pos_src,
+		void* dsturb, unsigned int pos_dst) {
+
+	unsigned int frames_left;
+	unsigned int field;
+	unsigned int frame_in_field;
+	unsigned int frames_to_next_header;
+	unsigned int transfer_size;
+	unsigned int transfer_size_frames;
+	unsigned int pos_src_, pos_dst_;
+	void* src;
+	void* dst;
+	pos_src_ = pos_src;
+	pos_dst_ = pos_dst;
+
+	frames_left = n;
+	while (frames_left) {
+		field = pos_dst / DT_SAMPLES_PER_BLOCK;
+		frame_in_field = pos_dst % DT_SAMPLES_PER_BLOCK;
+		frames_to_next_header = DT_SAMPLES_PER_BLOCK - frame_in_field;
+		src = srcbuf;
+		transfer_size_frames = (MIN(frames_to_next_header, frames_left));
+		transfer_size = transfer_size_frames * DT_PLAYBACK_FRAME_BYTES;
+		dst = dsturb + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES)
+				+ (DT_HEADER_SIZE_BYTES * (1 + field));
+		memcpy(dst, src, transfer_size);
+		pos_dst_ += transfer_size_frames;
+		pos_src_ += transfer_size_frames;
+		frames_left -= transfer_size_frames;
+	}
+}
+
+/*
  *  fill in dummy timestamp in playback data
  */
 static void fill_in_meta_playback(u8* data, unsigned int len) {
@@ -249,45 +319,23 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 {
 	struct snd_pcm_runtime *runtime;
 	unsigned int frame_bytes, frames1, frames_cpied;
-	const u8 *source, *dst;
+	void *source, *dst;
 
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
 	snd_printd("copy playback data frame_bytes: %u frames: %u", frame_bytes,
 			frames);
-	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
+	source = runtime->dma_area;
 	frames_cpied = 0;
 	dst = urb->transfer_buffer;
 
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		while (frames_cpied < frames) {
-			dst += DT_HEADER_SIZE_BYTES; // skip block header
-			memcpy((void*) dst, (void*) source,
-					DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			frames_cpied += DT_SAMPLES_PER_BLOCK;
-		}
+		cptourb(frames, source, 0, dst, stream->buffer_pos);
 	} else {
 		/* wrap around at end of ring buffer */
 		frames1 = runtime->buffer_size - stream->buffer_pos;
-		while (frames_cpied < frames1) {
-			dst += DT_HEADER_SIZE_BYTES; // skip block header
-			memcpy((void*) dst, (void*) source,
-			DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			frames_cpied += DT_SAMPLES_PER_BLOCK;
-		}
-		source = runtime->dma_area;
-		while (frames_cpied < (frames - frames1)) {
-			dst += DT_HEADER_SIZE_BYTES; // skip block header
-			memcpy((void*) dst, (void*) source,
-			DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			dst += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			source += (DT_PLAYBACK_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			frames_cpied += DT_SAMPLES_PER_BLOCK;
-		}
+		cptourb(frames1, source, 0, dst, stream->buffer_pos);
+		cptourb(frames1, source, frames1, dst, 0);
 	}
 
 	stream->buffer_pos += frames;
@@ -382,8 +430,8 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 			      unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, frames1, frames_cpied;
-	u8 *dest;
+	unsigned int frame_bytes, frames1;
+	void *dest;
 	void* src;
 
 	runtime = stream->substream->runtime;
@@ -391,36 +439,15 @@ static bool copy_capture_data(struct digitakt_stream *stream, struct urb *urb,
 	snd_printd("copy capture data frame_bytes: %u frames: %u",
 			frame_bytes,
 			frames);
-	dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
+	dest = runtime->dma_area;
 	src = urb->transfer_buffer;
-	frames_cpied = 0;
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		while (frames_cpied < frames) {
-			src += DT_HEADER_SIZE_BYTES; // skip block header
-			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			dest += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			frames_cpied += DT_SAMPLES_PER_BLOCK;
-		}
+		cpfmurb(frames, src, 0, dest, stream->buffer_pos);
 	} else {
 		/* wrap around at end of ring buffer */
 		frames1 = runtime->buffer_size - stream->buffer_pos;
-		while (frames_cpied < frames1) {
-			src += DT_HEADER_SIZE_BYTES; // skip block header
-			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			dest += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			frames_cpied += DT_SAMPLES_PER_BLOCK;
-		}
-		dest = runtime->dma_area;
-		src = urb->transfer_buffer + frames1 * frame_bytes;
-		while (frames_cpied < (frames - frames1)) {
-			src += DT_HEADER_SIZE_BYTES; // skip block header
-			memcpy(dest, src, DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			src += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			dest += (DT_RECORD_BLOCK_LEN_BYTES - DT_HEADER_SIZE_BYTES);
-			frames_cpied += DT_SAMPLES_PER_BLOCK;
-		}
+		cpfmurb(frames1, src, 0, dest, stream->buffer_pos);
+		cpfmurb((frames - frames1), src, frames1, dest, 0);
 	}
 
 	stream->buffer_pos += frames;
@@ -566,32 +593,12 @@ static int enable_alt_setting(struct digitakt *dt, unsigned int intf_index,
 	return 0;
 }
 
-//static void disable_alt_setting(struct digitakt *dt, unsigned int intf_index)
-//{
-//	struct usb_host_interface *alts;
-//
-//	if (!dt->intf[intf_index])
-//		return;
-//
-//	alts = dt->intf[intf_index]->cur_altsetting;
-//	if (alts->desc.bAlternateSetting != 0) {
-//		int err = usb_set_interface(dt->dev,
-//					    alts->desc.bInterfaceNumber, 0);
-//		if (err < 0 && !test_bit(DISCONNECTED, &dt->states))
-//			dev_warn(&dt->dev->dev,
-//				 "interface reset failed; error %d: %s\n",
-//				 err, usb_error_string(err));
-//	}
-//}
-
 static void stop_usb_capture(struct digitakt *dt)
 {
 	snd_printd("stop usb capture");
 	clear_bit(USB_CAPTURE_RUNNING, &dt->states);
 
 	kill_stream_urbs(&dt->capture);
-
-	//disable_alt_setting(dt, INTF_CAPTURE);
 }
 
 static int start_usb_capture(struct digitakt *dt)
