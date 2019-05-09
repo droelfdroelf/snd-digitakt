@@ -40,7 +40,7 @@ MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
 #define MIN_TRANSFER_SIZE_BLOCKS	2
 #define MAX_TRANSFER_SIZE_BLOCKS	24
 #define DEFAULT_TRANSFER_SIZE_BLOCKS	24
-#define MAX_MEMORY_BUFFERS	24
+#define MAX_MEMORY_BUFFERS	8
 
 static unsigned int transfer_size_blocks = DEFAULT_TRANSFER_SIZE_BLOCKS;
 
@@ -85,8 +85,8 @@ enum {
 
 /* bits in struct digitakt::states */
 enum {
-	USB_CAPTURE_RUNNING,
 	USB_PLAYBACK_RUNNING,
+	USB_CAPTURE_RUNNING,
 	ALSA_CAPTURE_OPEN,
 	ALSA_PLAYBACK_OPEN,
 	ALSA_CAPTURE_RUNNING,
@@ -110,15 +110,9 @@ struct digitakt {
 	struct mutex mutex;
 	unsigned long states;
 
-	/* FIFO to synchronize playback rate to capture rate */
-	unsigned int rate_feedback_start;
-	unsigned int rate_feedback_count;
-	u8 rate_feedback[MAX_TRANSFER_SIZE_BLOCKS];
-
 	struct list_head ready_playback_urbs;
 	struct tasklet_struct playback_tasklet;
 	wait_queue_head_t alsa_capture_wait;
-	wait_queue_head_t rate_feedback_wait;
 	wait_queue_head_t alsa_playback_wait;
 	struct digitakt_stream {
 		struct snd_pcm_substream *substream;
@@ -203,14 +197,20 @@ static void cpfmurb(unsigned int n, void* srcurb, unsigned int pos_src,
 		transfer_size_frames = (MIN(frames_to_next_header, frames_left));
 		transfer_size = transfer_size_frames * DT_RECORD_FRAME_BYTES;
 		dst = dstbuf + (pos_dst_ * DT_RECORD_FRAME_BYTES);
+		snd_printd("cpfmurb: %px -> %px, %u", src, dst, transfer_size_frames);
 		memcpy(dst, src, transfer_size);
 		pos_dst_ += transfer_size_frames;
 		pos_src_ += transfer_size_frames;
-		frames_left -= transfer_size_frames;
+		if (transfer_size_frames > frames_left) {
+			frames_left = 0;
+			snd_printd("cpfmurb WARNING - uneven buf size");
+		} else {
+			frames_left -= transfer_size_frames;
+		}
 	}
 }
 
-static void cptourb(unsigned int n, void* srcbuf, unsigned int pos_src,
+static void cptourb(unsigned int n, void* srcbuf,
 		void* dsturb, unsigned int pos_dst) {
 
 	unsigned int frames_left;
@@ -222,7 +222,7 @@ static void cptourb(unsigned int n, void* srcbuf, unsigned int pos_src,
 	unsigned int pos_src_, pos_dst_;
 	void* src;
 	void* dst;
-	pos_src_ = pos_src;
+
 	pos_dst_ = pos_dst;
 
 	frames_left = n;
@@ -235,10 +235,17 @@ static void cptourb(unsigned int n, void* srcbuf, unsigned int pos_src,
 		transfer_size = transfer_size_frames * DT_PLAYBACK_FRAME_BYTES;
 		dst = dsturb + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES)
 				+ (DT_HEADER_SIZE_BYTES * (1 + field));
+		snd_printd("cptourb: %px -> %px, %u", src, dst, transfer_size_frames);
+
 		memcpy(dst, src, transfer_size);
 		pos_dst_ += transfer_size_frames;
 		pos_src_ += transfer_size_frames;
-		frames_left -= transfer_size_frames;
+		if (transfer_size_frames > frames_left) {
+			frames_left = 0;
+			snd_printd("cptourb WARNING - uneven buf size");
+		} else {
+			frames_left -= transfer_size_frames;
+		}
 	}
 }
 
@@ -264,7 +271,6 @@ static void abort_usb_capture(struct digitakt *dt)
 	snd_printd("abort_usb_capture");
 	if (test_and_clear_bit(USB_CAPTURE_RUNNING, &dt->states)) {
 		wake_up(&dt->alsa_capture_wait);
-		wake_up(&dt->rate_feedback_wait);
 	}
 }
 
@@ -294,8 +300,8 @@ static void playback_urb_complete(struct urb *usb_urb)
 		/* append URB to FIFO */
 		spin_lock_irqsave(&dt->lock, flags);
 		list_add_tail(&urb->ready_list, &dt->ready_playback_urbs);
-		if (dt->rate_feedback_count > 0)
-			tasklet_schedule(&dt->playback_tasklet);
+
+		tasklet_schedule(&dt->playback_tasklet);
 		dt->playback.substream->runtime->delay -= DT_SAMPLES_PER_URB;
 		//	DT_SAMPLES_PER_URB;// todo: fix for variable number of packets per urb
 		spin_unlock_irqrestore(&dt->lock, flags);
@@ -318,24 +324,23 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 			       unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, frames1, frames_cpied;
+	unsigned int frame_bytes, frames1;
 	void *source, *dst;
 
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
 	snd_printd("copy playback data frame_bytes: %u frames: %u", frame_bytes,
 			frames);
-	source = runtime->dma_area;
-	frames_cpied = 0;
+	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	dst = urb->transfer_buffer;
 
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		cptourb(frames, source, 0, dst, stream->buffer_pos);
+		cptourb(frames, source, dst, stream->buffer_pos);
 	} else {
 		/* wrap around at end of ring buffer */
 		frames1 = runtime->buffer_size - stream->buffer_pos;
-		cptourb(frames1, source, 0, dst, stream->buffer_pos);
-		cptourb(frames1, source, frames1, dst, 0);
+		cptourb(frames1, source, dst, stream->buffer_pos);
+		cptourb(frames - frames1, runtime->dma_area, dst, frames - frames1);
 	}
 
 	stream->buffer_pos += frames;
@@ -381,19 +386,15 @@ static void playback_tasklet(unsigned long data)
 	 * nonempty.
 	 */
 	spin_lock_irqsave(&dt->lock, flags);
-	while (dt->rate_feedback_count > 0 && !list_empty(&dt->ready_playback_urbs)) {
+	while (!list_empty(&dt->ready_playback_urbs)) {
 		/* take packet size out of FIFO */
-		frames = dt->rate_feedback[dt->rate_feedback_start];
-		add_with_wraparound(dt, &dt->rate_feedback_start, 1);
-		dt->rate_feedback_count--;
-
 		/* take URB out of FIFO */
 		urb = list_first_entry(&dt->ready_playback_urbs,
 				struct digitakt_urb, ready_list);
 		list_del(&urb->ready_list);
 
 		/* fill packet with data or silence */
-
+		frames = DT_SAMPLES_PER_URB;
 		if (test_bit(ALSA_PLAYBACK_RUNNING, &dt->states))
 			do_period_elapsed |= copy_playback_data(&dt->playback,
 								&urb->urb,
@@ -466,7 +467,7 @@ static void capture_urb_complete(struct urb *urb)
 	struct digitakt *dt = urb->context;
 	struct digitakt_stream *stream = &dt->capture;
 	unsigned long flags;
-	unsigned int frames, write_ptr;
+	unsigned int frames;
 	bool do_period_elapsed;
 	int err;
 	snd_printd("capture_urb_complete stat %i", urb->status);
@@ -499,23 +500,6 @@ static void capture_urb_complete(struct urb *urb)
 			goto stream_stopped;
 		}
 
-		/* append packet size to FIFO */
-		write_ptr = dt->rate_feedback_start;
-		add_with_wraparound(dt, &write_ptr, dt->rate_feedback_count);
-		dt->rate_feedback[write_ptr] = frames;
-		if (dt->rate_feedback_count < dt->playback.queue_length) {
-			dt->rate_feedback_count++;
-			if (dt->rate_feedback_count == dt->playback.queue_length)
-				wake_up(&dt->rate_feedback_wait);
-		} else {
-			/*
-			 * Ring buffer overflow; this happens when the playback
-			 * stream is not running.  Throw away the oldest entry,
-			 * so that the playback stream, when it starts, sees
-			 * the most recent packet sizes.
-			 */
-			add_with_wraparound(dt, &dt->rate_feedback_start, 1);
-		}
 		if (test_bit(USB_PLAYBACK_RUNNING, &dt->states)
 				&& !list_empty(&dt->ready_playback_urbs))
 			tasklet_schedule(&dt->playback_tasklet);
@@ -551,9 +535,10 @@ static int submit_stream_urbs(struct digitakt *dt,
 {
 	unsigned int i;
 	snd_printd("submit_stream_urbs");
-	for (i = 0; i < stream->queue_length; ++i) {
-
+	for (i = 0; i < stream->queue_length; i++) {
+		// for (i = 0; i < 8; i++) {
 		int err = usb_submit_urb(&stream->urbs[i]->urb, GFP_KERNEL);
+		snd_printd("i: %u", i);
 		if (err < 0) {
 			dev_err(&dt->dev->dev, "USB request error %d: %s\n",
 				err, usb_error_string(err));
@@ -568,7 +553,7 @@ static void kill_stream_urbs(struct digitakt_stream *stream)
 {
 	unsigned int i;
 	snd_printd("kill_stream_urbs");
-	for (i = 0; i < stream->queue_length; ++i)
+	for (i = 0; i < stream->queue_length; i++)
 		if (stream->urbs[i])
 			usb_kill_urb(&stream->urbs[i]->urb);
 }
@@ -615,8 +600,6 @@ static int start_usb_capture(struct digitakt *dt)
 
 	clear_bit(CAPTURE_URB_COMPLETED, &dt->states);
 	dt->capture.urbs[0]->urb.complete = first_capture_urb_complete;
-	dt->rate_feedback_start = 0;
-	dt->rate_feedback_count = 0;
 
 	set_bit(USB_CAPTURE_RUNNING, &dt->states);
 	err = submit_stream_urbs(dt, &dt->capture);
@@ -631,17 +614,13 @@ static void stop_usb_playback(struct digitakt *dt)
 {
 	snd_printd("sstop usb playback");
 	clear_bit(USB_PLAYBACK_RUNNING, &dt->states);
-
 	kill_stream_urbs(&dt->playback);
-
 	tasklet_kill(&dt->playback_tasklet);
-
-	//disable_alt_setting(dt, INTF_PLAYBACK);
 }
 
 static int start_usb_playback(struct digitakt *dt)
 {
-	unsigned int i, frames;
+	unsigned int i;
 	struct urb *urb;
 	int err = 0;
 
@@ -667,10 +646,6 @@ static int start_usb_playback(struct digitakt *dt)
 	 */
 	snd_printd("playback wof");
 
-	wait_event(dt->rate_feedback_wait,
-			dt->rate_feedback_count >= dt->playback.queue_length
-					|| !test_bit(USB_CAPTURE_RUNNING, &dt->states)
-					|| test_bit(DISCONNECTED, &dt->states));
 	if (test_bit(DISCONNECTED, &dt->states)) {
 		stop_usb_playback(dt);
 		return -ENODEV;
@@ -680,15 +655,9 @@ static int start_usb_playback(struct digitakt *dt)
 		return -EIO;
 	}
 
-	for (i = 0; i < dt->playback.queue_length; ++i) {
+	for (i = 0; i < dt->playback.queue_length; i++) {
 		/* all initial URBs contain silence */
-		spin_lock_irq(&dt->lock);
-		frames = dt->rate_feedback[dt->rate_feedback_start];
-		add_with_wraparound(dt, &dt->rate_feedback_start, 1);
-		dt->rate_feedback_count--;
-		spin_unlock_irq(&dt->lock);
 		urb = &dt->playback.urbs[i]->urb;
-
 		memset(urb->transfer_buffer, 0,
 				transfer_size_blocks * DT_PLAYBACK_BLOCK_LEN_BYTES);
 		fill_in_meta_playback(urb->transfer_buffer,
@@ -762,45 +731,21 @@ static int set_stream_hw(struct digitakt *dt,
 	return err;
 }
 
-static int capture_pcm_open(struct snd_pcm_substream *substream)
+static int pcm_open(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
 	int err;
-	snd_printd("capture_pcm_open");
-	dt->capture.substream = substream;
-	err = set_stream_hw(dt, substream, dt->capture.channels);
-	if (err < 0)
-		return err;
-	substream->runtime->hw.fifo_size =
-		DIV_ROUND_CLOSEST(
-			dt->rate * dt->capture.queue_length,
-			dt->packets_per_second);
-	substream->runtime->delay = substream->runtime->hw.fifo_size;
-
-	mutex_lock(&dt->mutex);
-	err = start_usb_capture(dt);
-	if (err >= 0)
-		set_bit(ALSA_CAPTURE_OPEN, &dt->states);
-	mutex_unlock(&dt->mutex);
-	if (!err) {
-		snd_printd("capture_pcm_open OK");
+	snd_printd("pcm_open");
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		dt->playback.substream = substream;
+		err = set_stream_hw(dt, substream, dt->playback.channels);
+	} else {
+		dt->capture.substream = substream;
+		err = set_stream_hw(dt, substream, dt->capture.channels);
 	}
-	return err;
-}
-
-static int playback_pcm_open(struct snd_pcm_substream *substream)
-{
-	struct digitakt *dt = substream->private_data;
-	int err;
-	snd_printd("playback_pcm_open");
-	dt->playback.substream = substream;
-	err = set_stream_hw(dt, substream, dt->playback.channels);
 	if (err < 0)
 		return err;
-	substream->runtime->hw.fifo_size =
-		DIV_ROUND_CLOSEST(
-			dt->rate * dt->playback.queue_length, dt->packets_per_second);
-
+	substream->runtime->hw.fifo_size = 0;
 	mutex_lock(&dt->mutex);
 	err = start_usb_capture(dt);
 	if (err < 0)
@@ -815,25 +760,12 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 error:
 	mutex_unlock(&dt->mutex);
 	if (!err) {
-		snd_printd("playback_pcm_open OK");
+		snd_printd("pcm_open OK");
 	}
 	return err;
 }
 
-static int capture_pcm_close(struct snd_pcm_substream *substream)
-{
-	struct digitakt *dt = substream->private_data;
-
-	mutex_lock(&dt->mutex);
-	clear_bit(ALSA_CAPTURE_OPEN, &dt->states);
-	if (!test_bit(ALSA_PLAYBACK_OPEN, &dt->states))
-		stop_usb_capture(dt);
-	mutex_unlock(&dt->mutex);
-	snd_printd("capture_pcm_close");
-	return 0;
-}
-
-static int playback_pcm_close(struct snd_pcm_substream *substream)
+static int pcm_close(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
 
@@ -843,27 +775,12 @@ static int playback_pcm_close(struct snd_pcm_substream *substream)
 	if (!test_bit(ALSA_CAPTURE_OPEN, &dt->states))
 		stop_usb_capture(dt);
 	mutex_unlock(&dt->mutex);
-	snd_printd("playback_pcm_close");
+	snd_printd("pcm_close");
 	return 0;
 }
 
-static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
-				 struct snd_pcm_hw_params *hw_params)
-{
-	struct digitakt *dt = substream->private_data;
-	int err;
 
-	mutex_lock(&dt->mutex);
-	err = start_usb_capture(dt);
-	mutex_unlock(&dt->mutex);
-	if (err < 0)
-		return err;
-	snd_printd("record_pcm_hw_params");
-	return snd_pcm_lib_alloc_vmalloc_buffer(substream,
-						params_buffer_bytes(hw_params));
-}
-
-static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
+static int pcm_hw_params(struct snd_pcm_substream *substream,
 				  struct snd_pcm_hw_params *hw_params)
 {
 	struct digitakt *dt = substream->private_data;
@@ -876,7 +793,7 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	mutex_unlock(&dt->mutex);
 	if (err < 0)
 		return err;
-	snd_printd("playback_pcm_hw_params");
+	snd_printd("pcm_hw_params");
 	return snd_pcm_lib_alloc_vmalloc_buffer(substream,
 						params_buffer_bytes(hw_params));
 }
@@ -886,41 +803,11 @@ static int digitakt_pcm_hw_free(struct snd_pcm_substream *substream)
 	return snd_pcm_lib_free_vmalloc_buffer(substream);
 }
 
-static int capture_pcm_prepare(struct snd_pcm_substream *substream)
+static int pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
 	int err;
-	snd_printd("capture_pcm_prepare(..)");
-	mutex_lock(&dt->mutex);
-	err = start_usb_capture(dt);
-	mutex_unlock(&dt->mutex);
-	if (err < 0)
-		return err;
-
-	/*
-	 * The EHCI driver schedules the first packet of an iso stream at 10 ms
-	 * in the future, i.e., no data is actdtlly captured for that long.
-	 * Take the wait here so that the stream is known to be actdtlly
-	 * running when the start trigger has been called.
-	 */
-	wait_event(dt->alsa_capture_wait,
-			test_bit(CAPTURE_URB_COMPLETED, &dt->states)
-					|| !test_bit(USB_CAPTURE_RUNNING, &dt->states));
-	if (test_bit(DISCONNECTED, &dt->states))
-		return -ENODEV;
-	if (!test_bit(USB_CAPTURE_RUNNING, &dt->states))
-		return -EIO;
-	snd_printd("capture_pcm_prepare(..) OK");
-	dt->capture.period_pos = 0;
-	dt->capture.buffer_pos = 0;
-	return 0;
-}
-
-static int playback_pcm_prepare(struct snd_pcm_substream *substream)
-{
-	struct digitakt *dt = substream->private_data;
-	int err;
-	snd_printd("playback_pcm_prepare(..)");
+	snd_printd("pcm_prepare(..)");
 	mutex_lock(&dt->mutex);
 	err = start_usb_capture(dt);
 	if (err >= 0)
@@ -941,44 +828,29 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	substream->runtime->delay = 0;
 	dt->playback.period_pos = 0;
 	dt->playback.buffer_pos = 0;
-	snd_printd("playback_pcm_prepare(..) OK");
+	dt->capture.period_pos = 0;
+	dt->capture.buffer_pos = 0;
+	snd_printd("pcm_prepare(..) OK");
 	return 0;
 }
 
-static int capture_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+
+static int pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct digitakt *dt = substream->private_data;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		snd_printd("a trig STOP!");
-		if (!test_bit(USB_CAPTURE_RUNNING, &dt->states))
-			return -EIO;
+		snd_printd("trig START!");
+//		if (!test_bit(USB_PLAYBACK_RUNNING, &dt->states))
+//			return -EIO;
+		set_bit(ALSA_PLAYBACK_RUNNING, &dt->states);
 		set_bit(ALSA_CAPTURE_RUNNING, &dt->states);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
-		snd_printd("a trig STOP!");
-		clear_bit(ALSA_CAPTURE_RUNNING, &dt->states);
-		return 0;
-	default:
-		return -EINVAL;
-	}
-}
-
-static int playback_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
-{
-	struct digitakt *dt = substream->private_data;
-
-	switch (cmd) {
-	case SNDRV_PCM_TRIGGER_START:
-		snd_printd("p trig START!");
-		if (!test_bit(USB_PLAYBACK_RUNNING, &dt->states))
-			return -EIO;
-		set_bit(ALSA_PLAYBACK_RUNNING, &dt->states);
-		return 0;
-	case SNDRV_PCM_TRIGGER_STOP:
-		snd_printd("p trig STOP!");
+		snd_printd("trig STOP!");
 		clear_bit(ALSA_PLAYBACK_RUNNING, &dt->states);
+		clear_bit(ALSA_CAPTURE_RUNNING, &dt->states);
 		return 0;
 	default:
 		return -EINVAL;
@@ -997,41 +869,24 @@ static inline snd_pcm_uframes_t digitakt_pcm_pointer(struct digitakt *dt,
 	return pos;
 }
 
-static snd_pcm_uframes_t capture_pcm_pointer(struct snd_pcm_substream *subs)
+static snd_pcm_uframes_t pcm_pointer(struct snd_pcm_substream *subs)
 {
 	struct digitakt *dt = subs->private_data;
-
-	return digitakt_pcm_pointer(dt, &dt->capture);
+	if (subs->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		return digitakt_pcm_pointer(dt, &dt->playback);
+	else
+		return digitakt_pcm_pointer(dt, &dt->capture);
 }
 
-static snd_pcm_uframes_t playback_pcm_pointer(struct snd_pcm_substream *subs)
-{
-	struct digitakt *dt = subs->private_data;
-
-	return digitakt_pcm_pointer(dt, &dt->playback);
-}
-
-static const struct snd_pcm_ops capture_pcm_ops = {
-	.open = capture_pcm_open,
-	.close = capture_pcm_close,
+static const struct snd_pcm_ops pcm_ops = {
+	.open = pcm_open,
+	.close = pcm_close,
 	.ioctl = snd_pcm_lib_ioctl,
-	.hw_params = capture_pcm_hw_params,
+	.hw_params = pcm_hw_params,
 	.hw_free = digitakt_pcm_hw_free,
-	.prepare = capture_pcm_prepare,
-	.trigger = capture_pcm_trigger,
-	.pointer = capture_pcm_pointer,
-	.page = snd_pcm_lib_get_vmalloc_page,
-};
-
-static const struct snd_pcm_ops playback_pcm_ops = {
-	.open = playback_pcm_open,
-	.close = playback_pcm_close,
-	.ioctl = snd_pcm_lib_ioctl,
-	.hw_params = playback_pcm_hw_params,
-	.hw_free = digitakt_pcm_hw_free,
-	.prepare = playback_pcm_prepare,
-	.trigger = playback_pcm_trigger,
-	.pointer = playback_pcm_pointer,
+	.prepare = pcm_prepare,
+	.trigger = pcm_trigger,
+	.pointer = pcm_pointer,
 	.page = snd_pcm_lib_get_vmalloc_page,
 };
 
@@ -1040,14 +895,8 @@ static int alloc_stream_buffers(struct digitakt *dt,
 {
 	unsigned int i;
 	size_t size;
-// TODO: smaller?
-	stream->queue_length = transfer_size_blocks;
-	stream->queue_length = max(stream->queue_length,
-			(unsigned int) MIN_TRANSFER_SIZE_BLOCKS);
-	stream->queue_length = min(stream->queue_length,
-			(unsigned int) MAX_TRANSFER_SIZE_BLOCKS);
-
-	for (i = 0; i < ARRAY_SIZE(stream->buffers); ++i) {
+	stream->queue_length = MAX_MEMORY_BUFFERS;
+	for (i = 0; i < ARRAY_SIZE(stream->buffers); i++) {
 
 		size = stream->max_packet_bytes;
 		stream->buffers[i].addr =
@@ -1070,7 +919,7 @@ static void free_stream_buffers(struct digitakt *dt,
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(stream->buffers); ++i)
+	for (i = 0; i < ARRAY_SIZE(stream->buffers); i++)
 		usb_free_coherent(dt->dev,
 				  stream->buffers[i].size,
 				  stream->buffers[i].addr,
@@ -1087,7 +936,7 @@ static int alloc_stream_urbs(struct digitakt *dt,
 
 	snd_printd("stream->max_packet_bytes = %u", max_packet_size);
 
-	for (b = 0; b < ARRAY_SIZE(stream->buffers); ++b) {
+	for (b = 0; b < ARRAY_SIZE(stream->buffers); b++) {
 		unsigned int size = stream->buffers[b].size;
 		u8 *addr = stream->buffers[b].addr;
 		dma_addr_t dma = stream->buffers[b].dma;
@@ -1124,7 +973,7 @@ static void free_stream_urbs(struct digitakt_stream *stream)
 {
 	unsigned int i;
 
-	for (i = 0; i < stream->queue_length; ++i) {
+	for (i = 0; i < stream->queue_length; i++) {
 		kfree(stream->urbs[i]);
 		stream->urbs[i] = NULL;
 	}
@@ -1143,7 +992,7 @@ static void free_usb_related_resources(struct digitakt *dt,
 	free_stream_buffers(dt, &dt->capture);
 	free_stream_buffers(dt, &dt->playback);
 
-	for (i = 0; i < ARRAY_SIZE(dt->intf); ++i) {
+	for (i = 0; i < ARRAY_SIZE(dt->intf); i++) {
 		mutex_lock(&dt->mutex);
 		intf = dt->intf[i];
 		dt->intf[i] = NULL;
@@ -1160,7 +1009,6 @@ static void free_usb_related_resources(struct digitakt *dt,
 static void digitakt_card_free(struct snd_card *card)
 {
 	struct digitakt *dt = card->private_data;
-
 	mutex_destroy(&dt->mutex);
 }
 
@@ -1213,13 +1061,8 @@ static int digitakt_probe(struct usb_interface *interface,
 	tasklet_init(&dt->playback_tasklet,
 		     playback_tasklet, (unsigned long)dt);
 	init_waitqueue_head(&dt->alsa_capture_wait);
-	init_waitqueue_head(&dt->rate_feedback_wait);
 	init_waitqueue_head(&dt->alsa_playback_wait);
 
-//	err = usb_driver_set_configuration(dt->dev, 1);
-//	if (err < 0) {
-//		goto probe_error;
-//	}
 	snd_printd("sclaim");
 	dt->intf[0] = interface;
 	for (i = 1; i < ARRAY_SIZE(dt->intf); ++i) {
@@ -1299,8 +1142,8 @@ static int digitakt_probe(struct usb_interface *interface,
 		goto probe_error;
 	dt->pcm->private_data = dt;
 	strcpy(dt->pcm->name, name);
-	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_PLAYBACK, &playback_pcm_ops);
-	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_CAPTURE, &capture_pcm_ops);
+	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_PLAYBACK, &pcm_ops);
+	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_CAPTURE, &pcm_ops);
 
 	err = snd_usbmidi_create(card, dt->intf[3],
 				 &dt->midi_list, &midi_quirk);
@@ -1336,7 +1179,6 @@ static void digitakt_disconnect(struct usb_interface *interface)
 	mutex_lock(&devices_mutex);
 
 	set_bit(DISCONNECTED, &dt->states);
-	wake_up(&dt->rate_feedback_wait);
 
 	/* make sure that userspace cannot create new requests */
 	snd_card_disconnect(dt->card);
