@@ -40,7 +40,7 @@ MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
 #define MIN_TRANSFER_SIZE_BLOCKS	2
 #define MAX_TRANSFER_SIZE_BLOCKS	24
 #define DEFAULT_TRANSFER_SIZE_BLOCKS	24
-#define MAX_MEMORY_BUFFERS	8
+#define MAX_MEMORY_BUFFERS	4
 
 static unsigned int transfer_size_blocks = DEFAULT_TRANSFER_SIZE_BLOCKS;
 
@@ -109,7 +109,7 @@ struct digitakt {
 	spinlock_t lock;
 	struct mutex mutex;
 	unsigned long states;
-
+	unsigned int rate_feedback_count;
 	struct list_head ready_playback_urbs;
 	struct tasklet_struct playback_tasklet;
 	wait_queue_head_t alsa_capture_wait;
@@ -224,13 +224,14 @@ static void cptourb(unsigned int n, void* srcbuf,
 	void* dst;
 
 	pos_dst_ = pos_dst;
-
+	pos_src_ = 0;
+	snd_printd(">>> cptourb %u, %px, %px, %u", n, srcbuf, dsturb, pos_dst_);
 	frames_left = n;
 	while (frames_left) {
-		field = pos_dst / DT_SAMPLES_PER_BLOCK;
-		frame_in_field = pos_dst % DT_SAMPLES_PER_BLOCK;
+		field = pos_dst_ / DT_SAMPLES_PER_BLOCK;
+		frame_in_field = pos_dst_ % DT_SAMPLES_PER_BLOCK;
 		frames_to_next_header = DT_SAMPLES_PER_BLOCK - frame_in_field;
-		src = srcbuf;
+		src = srcbuf + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES);
 		transfer_size_frames = (MIN(frames_to_next_header, frames_left));
 		transfer_size = transfer_size_frames * DT_PLAYBACK_FRAME_BYTES;
 		dst = dsturb + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES)
@@ -335,12 +336,12 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 	dst = urb->transfer_buffer;
 
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		cptourb(frames, source, dst, stream->buffer_pos);
+		cptourb(frames, source, dst, 0);
 	} else {
 		/* wrap around at end of ring buffer */
 		frames1 = runtime->buffer_size - stream->buffer_pos;
-		cptourb(frames1, source, dst, stream->buffer_pos);
-		cptourb(frames - frames1, runtime->dma_area, dst, frames - frames1);
+		cptourb(frames1, source, dst, 0);
+		cptourb(frames - frames1, runtime->dma_area, dst, 0);
 	}
 
 	stream->buffer_pos += frames;
@@ -386,13 +387,13 @@ static void playback_tasklet(unsigned long data)
 	 * nonempty.
 	 */
 	spin_lock_irqsave(&dt->lock, flags);
-	while (!list_empty(&dt->ready_playback_urbs)) {
+	while (dt->rate_feedback_count > 0 && !list_empty(&dt->ready_playback_urbs)) {
 		/* take packet size out of FIFO */
 		/* take URB out of FIFO */
 		urb = list_first_entry(&dt->ready_playback_urbs,
 				struct digitakt_urb, ready_list);
 		list_del(&urb->ready_list);
-
+		dt->rate_feedback_count--;
 		/* fill packet with data or silence */
 		frames = DT_SAMPLES_PER_URB;
 		if (test_bit(ALSA_PLAYBACK_RUNNING, &dt->states))
@@ -499,7 +500,7 @@ static void capture_urb_complete(struct urb *urb)
 				err, usb_error_string(err));
 			goto stream_stopped;
 		}
-
+		dt->rate_feedback_count++;
 		if (test_bit(USB_PLAYBACK_RUNNING, &dt->states)
 				&& !list_empty(&dt->ready_playback_urbs))
 			tasklet_schedule(&dt->playback_tasklet);
@@ -597,7 +598,7 @@ static int start_usb_capture(struct digitakt *dt)
 		return 0;
 
 	kill_stream_urbs(&dt->capture);
-
+	dt->rate_feedback_count = 0;
 	clear_bit(CAPTURE_URB_COMPLETED, &dt->states);
 	dt->capture.urbs[0]->urb.complete = first_capture_urb_complete;
 
@@ -706,14 +707,13 @@ static int set_stream_hw(struct digitakt *dt,
 	substream->runtime->hw.rate_max = dt->rate;
 	substream->runtime->hw.channels_min = channels;
 	substream->runtime->hw.channels_max = channels;
-	substream->runtime->hw.periods_min = 2;
+	substream->runtime->hw.periods_min = 3;
 	substream->runtime->hw.periods_max = UINT_MAX;
 	// make sure to have even block boundaries in the buffers so we can copy whole blocks at once
 	//substream->runtime->min_align = channels * DT_SAMPLES_PER_BLOCK * 4;
-	substream->runtime->hw.buffer_bytes_max = 16 * DT_SAMPLES_PER_URB * 4
-			* channels;
+	substream->runtime->hw.buffer_bytes_max = 1024 * 1024 * 20;
 	// for now we support only a fixed buffer size
-	substream->runtime->hw.period_bytes_min = 1;
+	substream->runtime->hw.period_bytes_min = DT_SAMPLES_PER_URB;
 
 	substream->runtime->hw.period_bytes_max = UINT_MAX;
 	err = snd_pcm_hw_constraint_minmax(substream->runtime,
@@ -1105,7 +1105,7 @@ static int digitakt_probe(struct usb_interface *interface,
 	dt->playback.max_packet_bytes = DT_PLAYBACK_BLOCK_LEN_BYTES
 			* transfer_size_blocks;
 	dt->format_bit = SNDRV_PCM_FMTBIT_S32_BE;
-	dt->packets_per_second = 8000;
+	dt->packets_per_second = 286;
 
 	dt->playback.frame_bytes = 4 * dt->playback.channels;
 	dt->capture.frame_bytes = 4 * dt->capture.channels;
