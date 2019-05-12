@@ -197,7 +197,7 @@ static void cpfmurb(unsigned int n, void* srcurb, unsigned int pos_src,
 		transfer_size_frames = (MIN(frames_to_next_header, frames_left));
 		transfer_size = transfer_size_frames * DT_RECORD_FRAME_BYTES;
 		dst = dstbuf + (pos_dst_ * DT_RECORD_FRAME_BYTES);
-		snd_printd("cpfmurb: %px -> %px, %u", src, dst, transfer_size_frames);
+//		snd_printd("cpfmurb: %px -> %px, %u", src, dst, transfer_size_frames);
 		memcpy(dst, src, transfer_size);
 		pos_dst_ += transfer_size_frames;
 		pos_src_ += transfer_size_frames;
@@ -225,7 +225,7 @@ static void cptourb(unsigned int n, void* srcbuf,
 
 	pos_dst_ = pos_dst;
 	pos_src_ = 0;
-	snd_printd(">>> cptourb %u, %px, %px, %u", n, srcbuf, dsturb, pos_dst_);
+//	snd_printd(">>> cptourb %u, %px, %px, %u", n, srcbuf, dsturb, pos_dst_);
 	frames_left = n;
 	while (frames_left) {
 		field = pos_dst_ / DT_SAMPLES_PER_BLOCK;
@@ -236,7 +236,7 @@ static void cptourb(unsigned int n, void* srcbuf,
 		transfer_size = transfer_size_frames * DT_PLAYBACK_FRAME_BYTES;
 		dst = dsturb + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES)
 				+ (DT_HEADER_SIZE_BYTES * (1 + field));
-		snd_printd("cptourb: %px -> %px, %u", src, dst, transfer_size_frames);
+		//	snd_printd("cptourb: %px -> %px, %u", src, dst, transfer_size_frames);
 
 		memcpy(dst, src, transfer_size);
 		pos_dst_ += transfer_size_frames;
@@ -330,8 +330,8 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
-	snd_printd("copy playback data frame_bytes: %u frames: %u", frame_bytes,
-			frames);
+	//snd_printd("copy playback data frame_bytes: %u frames: %u", frame_bytes,
+	//	frames);
 	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	dst = urb->transfer_buffer;
 
@@ -341,7 +341,7 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 		/* wrap around at end of ring buffer */
 		frames1 = runtime->buffer_size - stream->buffer_pos;
 		cptourb(frames1, source, dst, 0);
-		cptourb(frames - frames1, runtime->dma_area, dst, 0);
+		cptourb(frames - frames1, runtime->dma_area, dst, frames1);
 	}
 
 	stream->buffer_pos += frames;
