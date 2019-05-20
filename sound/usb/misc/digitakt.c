@@ -210,29 +210,63 @@ static void cpfmurb(unsigned int n, void* srcurb, unsigned int pos_src,
 	}
 }
 
-static void cptourb(unsigned int n, void* srcbuf,
-		void* dsturb, unsigned int pos_dst) {
+static int32_t betole(uint8_t* data) {
+	int32_t ret;
+	*((uint8_t*) (&ret)) = data[3];
+	*(((uint8_t*) (&ret)) + 1) = data[2];
+	*(((uint8_t*) (&ret)) + 2) = data[1];
+	*(((uint8_t*) (&ret)) + 3) = data[0];
+	return ret;
+}
 
-	unsigned int frames_left;
+static void cptourb(unsigned int n_samples, void* srcbuf, void* dsturb,
+		unsigned int start_pos_samples) {
+
+	unsigned int samples_left;
 	unsigned int field;
 	unsigned int frame_in_field;
 	unsigned int frames_to_next_header;
 	unsigned int transfer_size;
 	unsigned int transfer_size_frames;
-	unsigned int pos_src_, pos_dst_;
+	unsigned int pos_src, pos_dst_, pos_samples;
+	unsigned int dst_offst;
 	void* src;
 	void* dst;
+	static int32_t first, second;
 
-	pos_dst_ = pos_dst;
-	pos_src_ = 0;
-//	snd_printd(">>> cptourb %u, %px, %px, %u", n, srcbuf, dsturb, pos_dst_);
-	frames_left = n;
-	while (frames_left) {
+	pos_src = 0;
+	pos_dst_ = start_pos_samples;
+	src = srcbuf;
+	samples_left = n_samples;
+	pos_samples = start_pos_samples;
+	while (samples_left) {
+		src = srcbuf + (pos_src * DT_PLAYBACK_FRAME_BYTES);
+		dst = dsturb
+				+ ((((pos_samples / 7) + 1) * 4) + pos_samples)
+						* DT_PLAYBACK_FRAME_BYTES; // offset in samples due to headers
+		memcpy(dst, src, DT_PLAYBACK_FRAME_BYTES);
+		pos_dst_++;
+		pos_src++;
+		pos_samples++;
+		samples_left--;
+	}
+
+	/*	first = betole((uint8_t*) srcbuf);
+	snd_printd(">>> cptourb %i (%i, %i)", second - first, first, second);
+	 second = betole((uint8_t*) srcbuf + (n_samples - 1) * 8);
+
+	 samples_left = n_samples;
+	 while (samples_left) {
 		field = pos_dst_ / DT_SAMPLES_PER_BLOCK;
 		frame_in_field = pos_dst_ % DT_SAMPLES_PER_BLOCK;
 		frames_to_next_header = DT_SAMPLES_PER_BLOCK - frame_in_field;
+
+
 		src = srcbuf + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES);
 		transfer_size_frames = (MIN(frames_to_next_header, frames_left));
+		if (transfer_size_frames == 0) {
+			snd_printd("cptourb WARNING - transfersizeframes is 0!");
+		}
 		transfer_size = transfer_size_frames * DT_PLAYBACK_FRAME_BYTES;
 		dst = dsturb + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES)
 				+ (DT_HEADER_SIZE_BYTES * (1 + field));
@@ -241,13 +275,13 @@ static void cptourb(unsigned int n, void* srcbuf,
 		memcpy(dst, src, transfer_size);
 		pos_dst_ += transfer_size_frames;
 		pos_src_ += transfer_size_frames;
-		if (transfer_size_frames > frames_left) {
-			frames_left = 0;
+	 if (transfer_size_frames > samples_left) {
+	 samples_left = 0;
 			snd_printd("cptourb WARNING - uneven buf size");
 		} else {
-			frames_left -= transfer_size_frames;
+	 samples_left -= transfer_size_frames;
 		}
-	}
+	 }*/
 }
 
 /*
@@ -301,8 +335,8 @@ static void playback_urb_complete(struct urb *usb_urb)
 		/* append URB to FIFO */
 		spin_lock_irqsave(&dt->lock, flags);
 		list_add_tail(&urb->ready_list, &dt->ready_playback_urbs);
-
-		tasklet_schedule(&dt->playback_tasklet);
+		if (dt->rate_feedback_count > 0)
+			tasklet_schedule(&dt->playback_tasklet);
 		dt->playback.substream->runtime->delay -= DT_SAMPLES_PER_URB;
 		//	DT_SAMPLES_PER_URB;// todo: fix for variable number of packets per urb
 		spin_unlock_irqrestore(&dt->lock, flags);
@@ -327,11 +361,12 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 	struct snd_pcm_runtime *runtime;
 	unsigned int frame_bytes, frames1;
 	void *source, *dst;
+	static unsigned int last_buf_pos = 0;
+	static unsigned int last_per_pos = 0;
 
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
-	//snd_printd("copy playback data frame_bytes: %u frames: %u", frame_bytes,
-	//	frames);
+	//
 	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	dst = urb->transfer_buffer;
 
@@ -339,10 +374,22 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 		cptourb(frames, source, dst, 0);
 	} else {
 		/* wrap around at end of ring buffer */
+
+		//	frames);
 		frames1 = runtime->buffer_size - stream->buffer_pos;
+		snd_printd("wrap frame_bytes: %u frames: %u frames1: %u", frame_bytes,
+				frames, frames1);
+		snd_printd("wrap: %px -> %px", source, dst);
+
 		cptourb(frames1, source, dst, 0);
 		cptourb(frames - frames1, runtime->dma_area, dst, frames1);
 	}
+
+	snd_printd("positions: b: %u %u p: %u %u", stream->buffer_pos,
+			stream->buffer_pos - last_buf_pos, stream->period_pos,
+			stream->period_pos - last_per_pos);
+	last_buf_pos = stream->buffer_pos;
+	last_per_pos = stream->period_pos;
 
 	stream->buffer_pos += frames;
 	if (stream->buffer_pos >= runtime->buffer_size)
@@ -375,6 +422,7 @@ static void playback_tasklet(unsigned long data)
 	if (unlikely(!test_bit(USB_PLAYBACK_RUNNING, &dt->states)))
 		return;
 	snd_printd("playback tasklet");
+	snd_printd("fbcount: %u", dt->rate_feedback_count);
 	/*
 	 * Synchronizing the playback rate to the capture rate is done by using
 	 * the same sequence of packet sizes for both streams.
@@ -707,14 +755,16 @@ static int set_stream_hw(struct digitakt *dt,
 	substream->runtime->hw.rate_max = dt->rate;
 	substream->runtime->hw.channels_min = channels;
 	substream->runtime->hw.channels_max = channels;
-	substream->runtime->hw.periods_min = 3;
+	substream->runtime->hw.periods_min = 2;
 	substream->runtime->hw.periods_max = UINT_MAX;
 	// make sure to have even block boundaries in the buffers so we can copy whole blocks at once
 	//substream->runtime->min_align = channels * DT_SAMPLES_PER_BLOCK * 4;
 	substream->runtime->hw.buffer_bytes_max = 1024 * 1024 * 20;
 	// for now we support only a fixed buffer size
-	substream->runtime->hw.period_bytes_min = DT_SAMPLES_PER_URB;
-
+	substream->runtime->hw.period_bytes_min = 4 * channels
+			* DT_SAMPLES_PER_URB;
+	snd_printd("period_bytes_min: %lu",
+			substream->runtime->hw.period_bytes_min);
 	substream->runtime->hw.period_bytes_max = UINT_MAX;
 	err = snd_pcm_hw_constraint_minmax(substream->runtime,
 					   SNDRV_PCM_HW_PARAM_PERIOD_TIME,
@@ -742,6 +792,10 @@ static int pcm_open(struct snd_pcm_substream *substream)
 	} else {
 		dt->capture.substream = substream;
 		err = set_stream_hw(dt, substream, dt->capture.channels);
+		substream->runtime->hw.fifo_size = DIV_ROUND_CLOSEST(dt->rate,
+				dt->packets_per_second);
+		substream->runtime->delay = substream->runtime->hw.fifo_size;
+
 	}
 	if (err < 0)
 		return err;
@@ -1017,7 +1071,8 @@ static int digitakt_probe(struct usb_interface *interface,
 {
 	static const struct snd_usb_midi_endpoint_info midi_ep = {
 		.out_cables =
-			0x0000, .in_cables = 0x0000, .in_ep = 0x81, .out_ep = 0x01
+			0x0000, .in_cables = 0x0000, .in_ep = 0x81, .out_ep = 0x01,
+			.in_interval = 2, .out_interval = 2
 	};
 	static const struct snd_usb_audio_quirk midi_quirk = {
 		.type = QUIRK_MIDI_FIXED_ENDPOINT,
