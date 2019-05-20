@@ -210,29 +210,13 @@ static void cpfmurb(unsigned int n, void* srcurb, unsigned int pos_src,
 	}
 }
 
-static int32_t betole(uint8_t* data) {
-	int32_t ret;
-	*((uint8_t*) (&ret)) = data[3];
-	*(((uint8_t*) (&ret)) + 1) = data[2];
-	*(((uint8_t*) (&ret)) + 2) = data[1];
-	*(((uint8_t*) (&ret)) + 3) = data[0];
-	return ret;
-}
-
 static void cptourb(unsigned int n_samples, void* srcbuf, void* dsturb,
 		unsigned int start_pos_samples) {
 
 	unsigned int samples_left;
-	unsigned int field;
-	unsigned int frame_in_field;
-	unsigned int frames_to_next_header;
-	unsigned int transfer_size;
-	unsigned int transfer_size_frames;
 	unsigned int pos_src, pos_dst_, pos_samples;
-	unsigned int dst_offst;
 	void* src;
 	void* dst;
-	static int32_t first, second;
 
 	pos_src = 0;
 	pos_dst_ = start_pos_samples;
@@ -250,38 +234,6 @@ static void cptourb(unsigned int n_samples, void* srcbuf, void* dsturb,
 		pos_samples++;
 		samples_left--;
 	}
-
-	/*	first = betole((uint8_t*) srcbuf);
-	snd_printd(">>> cptourb %i (%i, %i)", second - first, first, second);
-	 second = betole((uint8_t*) srcbuf + (n_samples - 1) * 8);
-
-	 samples_left = n_samples;
-	 while (samples_left) {
-		field = pos_dst_ / DT_SAMPLES_PER_BLOCK;
-		frame_in_field = pos_dst_ % DT_SAMPLES_PER_BLOCK;
-		frames_to_next_header = DT_SAMPLES_PER_BLOCK - frame_in_field;
-
-
-		src = srcbuf + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES);
-		transfer_size_frames = (MIN(frames_to_next_header, frames_left));
-		if (transfer_size_frames == 0) {
-			snd_printd("cptourb WARNING - transfersizeframes is 0!");
-		}
-		transfer_size = transfer_size_frames * DT_PLAYBACK_FRAME_BYTES;
-		dst = dsturb + (pos_dst_ * DT_PLAYBACK_FRAME_BYTES)
-				+ (DT_HEADER_SIZE_BYTES * (1 + field));
-		//	snd_printd("cptourb: %px -> %px, %u", src, dst, transfer_size_frames);
-
-		memcpy(dst, src, transfer_size);
-		pos_dst_ += transfer_size_frames;
-		pos_src_ += transfer_size_frames;
-	 if (transfer_size_frames > samples_left) {
-	 samples_left = 0;
-			snd_printd("cptourb WARNING - uneven buf size");
-		} else {
-	 samples_left -= transfer_size_frames;
-		}
-	 }*/
 }
 
 /*
