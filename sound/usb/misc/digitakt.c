@@ -76,10 +76,11 @@ module_param(transfer_size_blocks, uint, 0644);
 MODULE_PARM_DESC(transfer_size_blocks, "transfer size in blocks");
 
 enum {
-	INTF_PLAYBACK,
+	INTF_PLAYBACK = 0,
 	INTF_CAPTURE,
+	INTF_UNKNOWN_A,
 	INTF_MIDI,
-
+	INTF_UNKNOWN_B,
 	INTF_COUNT = 5
 };
 
@@ -1023,8 +1024,8 @@ static int digitakt_probe(struct usb_interface *interface,
 {
 	static const struct snd_usb_midi_endpoint_info midi_ep = {
 		.out_cables =
-			0x0000, .in_cables = 0x0000, .in_ep = 0x81, .out_ep = 0x01,
-			.in_interval = 2, .out_interval = 2
+			0x0001, .in_cables = 0x0001, .in_ep = 0x81, .out_ep = 0x01,
+			.in_interval = 0, .out_interval = 0// 0 is for bulk transfer in midi.c
 	};
 	static const struct snd_usb_audio_quirk midi_quirk = {
 		.type = QUIRK_MIDI_FIXED_ENDPOINT,
@@ -1152,7 +1153,7 @@ static int digitakt_probe(struct usb_interface *interface,
 	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_PLAYBACK, &pcm_ops);
 	snd_pcm_set_ops(dt->pcm, SNDRV_PCM_STREAM_CAPTURE, &pcm_ops);
 
-	err = snd_usbmidi_create(card, dt->intf[3],
+	err = snd_usbmidi_create(card, dt->intf[INTF_MIDI],
 				 &dt->midi_list, &midi_quirk);
 	if (err < 0)
 		goto probe_error;
