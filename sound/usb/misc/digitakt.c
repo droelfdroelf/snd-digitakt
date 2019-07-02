@@ -24,8 +24,8 @@
 #include <sound/initval.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
-#include "../usbaudio.h"
-#include "../midi.h"
+#include "usbaudio.h"
+#include "midi.h"
 
 MODULE_DESCRIPTION("Elektron Digitakt driver");
 MODULE_AUTHOR("Stefan Rehm <droelfdroelf@gmail.com>");
