@@ -39,7 +39,7 @@ MODULE_SUPPORTED_DEVICE("{{Elektron,Digitakt}}");
 
 #define MIN_TRANSFER_SIZE_BLOCKS	2
 #define MAX_TRANSFER_SIZE_BLOCKS	24
-#define DEFAULT_TRANSFER_SIZE_BLOCKS	24
+#define DEFAULT_TRANSFER_SIZE_BLOCKS	8
 #define MAX_MEMORY_BUFFERS	4
 
 static unsigned int transfer_size_blocks = DEFAULT_TRANSFER_SIZE_BLOCKS;
@@ -113,6 +113,8 @@ struct digitakt {
 	unsigned int rate_feedback_count;
 	struct list_head ready_playback_urbs;
 	struct tasklet_struct playback_tasklet;
+	// see https://github.com/tiwai/sound/commit/45e4d67f8a53e713833292cc5fef3603294a5914
+	// struct work_struct playback_work;
 	wait_queue_head_t alsa_capture_wait;
 	wait_queue_head_t alsa_playback_wait;
 	struct digitakt_stream {
@@ -143,7 +145,7 @@ static struct usb_driver digitakt_driver;
 static void abort_alsa_playback(struct digitakt *dt);
 static void abort_alsa_capture(struct digitakt *dt);
 
-static const char *usb_error_string(int err)
+static const char* usb_error_string(int err)
 {
 	switch (err) {
 	case -ENODEV:
@@ -291,7 +293,6 @@ static void playback_urb_complete(struct urb *usb_urb)
 		if (dt->rate_feedback_count > 0)
 			tasklet_schedule(&dt->playback_tasklet);
 		dt->playback.substream->runtime->delay -= DT_SAMPLES_PER_URB;
-		//	DT_SAMPLES_PER_URB;// todo: fix for variable number of packets per urb
 		spin_unlock_irqrestore(&dt->lock, flags);
 	}
 }
@@ -322,7 +323,7 @@ static bool copy_playback_data(struct digitakt_stream *stream, struct urb *urb,
 	//
 	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
 	dst = urb->transfer_buffer;
-
+	// todo: what happens if alsa buffer > urb?
 	if (stream->buffer_pos + frames <= runtime->buffer_size) {
 		cptourb(frames, source, dst, 0);
 	} else {
@@ -481,7 +482,7 @@ static void capture_urb_complete(struct urb *urb)
 
 	if (urb->status >= 0) {
 		//urb->actual_length /
-		frames = DT_SAMPLES_PER_URB;	// again hard coded ...
+		frames = DT_SAMPLES_PER_URB;
 	}
 	else
 		frames = 0;
@@ -532,13 +533,27 @@ static void first_capture_urb_complete(struct urb *urb)
 	wake_up(&dt->alsa_capture_wait);
 }
 
+static void set_transfer_length(struct digitakt *dt) {
+	unsigned int b;
+	for (b = 0; b < ARRAY_SIZE(dt->capture.urbs); b++) {
+		dt->capture.urbs[b]->urb.transfer_buffer_length =
+				TRANSFER_IN_DATA_SIZE;
+	}
+	for (b = 0; b < ARRAY_SIZE(dt->playback.urbs); b++) {
+		dt->playback.urbs[b]->urb.transfer_buffer_length =
+				TRANSFER_OUT_DATA_SIZE;
+	}
+}
+
 static int submit_stream_urbs(struct digitakt *dt,
 		struct digitakt_stream *stream)
 {
 	unsigned int i;
+	// set actual urb transfer size which might be lower than total buffer size
+	// because hw_prepare calculates the optimal buffer size for a given alsa period size
+	set_transfer_length(dt);
 	snd_printdd("submit_stream_urbs");
 	for (i = 0; i < stream->queue_length; i++) {
-		// for (i = 0; i < 8; i++) {
 		int err = usb_submit_urb(&stream->urbs[i]->urb, GFP_KERNEL);
 		snd_printdd("i: %u", i);
 		if (err < 0) {
@@ -707,15 +722,12 @@ static int set_stream_hw(struct digitakt *dt,
 	substream->runtime->hw.rate_max = dt->rate;
 	substream->runtime->hw.channels_min = channels;
 	substream->runtime->hw.channels_max = channels;
-	substream->runtime->hw.periods_min = 2;
+	substream->runtime->hw.periods_min = 3;
 	substream->runtime->hw.periods_max = UINT_MAX;
-	// make sure to have even block boundaries in the buffers so we can copy whole blocks at once
-	//substream->runtime->min_align = channels * DT_SAMPLES_PER_BLOCK * 4;
 	substream->runtime->hw.buffer_bytes_max = 1024 * 1024 * 20;
-	// for now we support only a fixed buffer size
-	//substream->runtime->hw.period_bytes_min = 4 * channels
-	//		* DT_SAMPLES_PER_URB;
-	substream->runtime->hw.period_bytes_min = 64;
+// todo: way to big! dynamic?
+	substream->runtime->hw.period_bytes_min = 4 * channels * DT_SAMPLES_PER_URB;
+	// substream->runtime->hw.period_bytes_min = 64;
 	snd_printdd("period_bytes_min: %lu",
 			substream->runtime->hw.period_bytes_min);
 	substream->runtime->hw.period_bytes_max = UINT_MAX;
@@ -792,8 +804,23 @@ static int pcm_hw_params(struct snd_pcm_substream *substream,
 				  struct snd_pcm_hw_params *hw_params)
 {
 	struct digitakt *dt = substream->private_data;
+	unsigned int numblocks;
 	int err;
 
+	struct snd_interval *pt = hw_param_interval(hw_params,
+	SNDRV_PCM_HW_PARAM_PERIOD_TIME);
+	if (pt->empty) {
+		snd_printdd("HW_PARAM_PERIOD_TIME empty!");
+		return -1;
+	} else {
+		// us to samples
+		numblocks = ((pt->max * 48) / 1000) / DT_SAMPLES_PER_BLOCK;
+		snd_printd("hwperiodmax = %u calculated blocks = %u (%u samples)",
+				pt->max, numblocks, numblocks * DT_SAMPLES_PER_BLOCK);
+		transfer_size_blocks = numblocks;
+		// update transfer size in urbs
+
+	}
 	mutex_lock(&dt->mutex);
 	err = start_usb_capture(dt);
 	if (err >= 0)
@@ -814,8 +841,19 @@ static int digitakt_pcm_hw_free(struct snd_pcm_substream *substream)
 static int pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct digitakt *dt = substream->private_data;
+	// todo: set samples per transfer here
+//	if (subs->stream == SNDRV_PCM_STREAM_PLAYBACK){
+//
+//		DT_RECORD_BLOCK_LEN_BYTES
+//						* transfer_size_blocks;
+//	}
+//	else {
+//
+//	}
+
+
 	int err;
-	snd_printdd("pcm_prepare(..)");
+	snd_printd("pcm_prepare(..)");
 	mutex_lock(&dt->mutex);
 	err = start_usb_capture(dt);
 	if (err >= 0)
@@ -838,7 +876,7 @@ static int pcm_prepare(struct snd_pcm_substream *substream)
 	dt->playback.buffer_pos = 0;
 	dt->capture.period_pos = 0;
 	dt->capture.buffer_pos = 0;
-	snd_printdd("pcm_prepare(..) OK");
+	snd_printd("pcm_prepare(..) OK");
 	return 0;
 }
 
@@ -1114,6 +1152,7 @@ static int digitakt_probe(struct usb_interface *interface,
 	dt->playback.max_packet_bytes = DT_PLAYBACK_BLOCK_LEN_BYTES
 			* transfer_size_blocks;
 	dt->format_bit = SNDRV_PCM_FMTBIT_S32_BE;
+	// todo: why a fixed value here?
 	dt->packets_per_second = 286;
 
 	dt->playback.frame_bytes = 4 * dt->playback.channels;
