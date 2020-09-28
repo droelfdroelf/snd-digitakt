@@ -10,7 +10,9 @@
  * It is not referenced from the code, but GCC < 5 with -fPIE would fail
  * due to an undefined symbol. Define it to make these ancient GCCs work.
  */
+#ifndef CONFIG_RANDOMIZE_BASE
 unsigned long __force_order;
+#endif
 
 #define BIOS_START_MIN		0x20000U	/* 128K, less than this is insane */
 #define BIOS_START_MAX		0x9f000U	/* 640K, absolute maximum */
