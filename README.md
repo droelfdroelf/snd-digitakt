@@ -1,3 +1,7 @@
+# NOTE:
+Due to the lack of time, development (on my side) has been stopped (still feel free to submit PRs ;)). Meanwhile, for a working and actively developed Overbridge<->JACK bridge, please see:
+https://github.com/dagargo/overwitch
+
 # snd-digitakt
 ALSA driver for the Elektron Digitakt
 
